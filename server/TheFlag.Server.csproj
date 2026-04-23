@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <InvariantGlobalization>false</InvariantGlobalization>
+    <ApplicationIcon>icon.ico</ApplicationIcon>
+    <Title>THE FLAG - WebSocket Server</Title>
+    <Authors>David Jorge Aguirre Grazio</Authors>
+    <Product>THE FLAG - WebSocket Server</Product>
+    <Description>THE FLAG - WebSocket Server</Description>
+    <Copyright>Copyright © 2026 by David Jorge Aguirre Grazio</Copyright>
+  </PropertyGroup>
+  <ItemGroup>
+    <Content Include="icon.ico" />
+  </ItemGroup>
+</Project>

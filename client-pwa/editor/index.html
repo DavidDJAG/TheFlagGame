@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TheFlag Map Editor</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand-block">
+        <h1>TheFlag Map Editor</h1>
+        <p>2D canvas used to define the perimeter, obstacles, and flags.</p>
+      </div>
+
+      <div class="topbar-actions">
+        <label>
+          <span>Map name</span>
+          <input id="mapNameInput" type="text" value="New map" maxlength="80" />
+        </label>
+
+        <label>
+          <span>Width</span>
+          <input id="mapWidthInput" type="number" min="400" max="4000" step="10" value="1400" />
+        </label>
+
+        <label>
+          <span>Height</span>
+          <input id="mapHeightInput" type="number" min="300" max="3000" step="10" value="900" />
+        </label>
+
+        <button id="applyCanvasSizeBtn" class="secondary">Apply size</button>
+        <button id="loadServerMapBtn" class="secondary">Load from server</button>
+        <button id="saveServerMapBtn" class="primary">Save to server</button>
+        <button id="saveJsonBtn" class="secondary">Save JSON</button>
+
+        <label class="file-loader secondary file-loader-label">
+          <span>Load JSON</span>
+          <input id="loadJsonInput" type="file" accept="application/json,.json" />
+        </label>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <aside class="sidebar left-sidebar">
+        <section class="panel">
+          <h2>Tools</h2>
+          <div id="toolButtons" class="tool-grid">
+            <button data-tool="select" class="tool-button active">Select / move</button>
+            <button data-tool="perimeter" class="tool-button">Hard perimeter</button>
+            <button data-tool="polygon" class="tool-button">Polygon</button>
+            <button data-tool="rect" class="tool-button">Rectangle</button>
+            <button data-tool="circle" class="tool-button">Circle</button>
+            <button data-tool="flag" class="tool-button">Flag</button>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Options</h2>
+          <div class="panel-stack">
+            <label>
+              <span>Flag team</span>
+              <select id="flagTeamSelect">
+                <option value="blue">Blue</option>
+                <option value="red">Red</option>
+              </select>
+            </label>
+
+            <label class="checkbox-row">
+              <input id="snapToGridInput" type="checkbox" checked />
+              <span>Snap to grid (10 px)</span>
+            </label>
+
+            <div class="button-row">
+              <button id="finishShapeBtn" class="secondary">Close shape</button>
+              <button id="cancelShapeBtn" class="secondary">Cancel</button>
+            </div>
+
+            <div class="button-row">
+              <button id="deleteSelectedBtn" class="danger">Delete selected</button>
+              <button id="clearAllBtn" class="danger ghost">Clear map</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel compact-panel">
+          <h2>Selected object</h2>
+          <div id="selectedObjectDetails" class="selected-details empty-state">No object selected.</div>
+        </section>
+
+        <section class="panel compact-panel">
+          <h2>Summary</h2>
+          <div id="summaryBlock" class="summary-block"></div>
+        </section>
+
+        <section class="panel">
+          <h2>Instructions</h2>
+          <ul class="help-list">
+            <li><strong>Perimeter / Polygon:</strong> click to add vertices. Close the shape with the first point, <kbd>Enter</kbd>, or the <em>Close shape</em> button.</li>
+            <li><strong>Rectangle / Circle:</strong> click and drag.</li>
+            <li><strong>Flag:</strong> click to place it. Change the team in the dropdown.</li>
+            <li><strong>Selection:</strong> click an object to move it. If it is selected and is not a circle, drag its points for precise editing.</li>
+            <li><strong>Pan:</strong> in selection mode, use <kbd>Ctrl</kbd> + drag to move around the map while zoomed in.</li>
+            <li><strong>Zoom:</strong> use the buttons, <kbd>+</kbd>, <kbd>-</kbd>, <kbd>0</kbd>, or the mouse wheel over the map. Zoom stays centered on the current cursor position.</li>
+            <li><strong>JSON:</strong> save the map and reload it whenever you want.</li>
+            <li><strong>Server:</strong> use <em>Load from server</em> to fetch <code>GET /api/map</code> and <em>Save to server</em> to send <code>PUT /api/map</code>.</li>
+          </ul>
+        </section>
+      </aside>
+
+      <section class="canvas-section">
+        <div class="canvas-toolbar">
+          <div>
+            <strong>Status:</strong>
+            <span id="statusText">Ready.</span>
+          </div>
+          <div>
+            <strong>Validation:</strong>
+            <span id="validationText">Not validated.</span>
+          </div>
+          <div class="zoom-controls">
+            <span class="zoom-label">Zoom</span>
+            <button id="zoomOutBtn" type="button" class="secondary">-</button>
+            <button id="zoomResetBtn" type="button" class="secondary">100%</button>
+            <button id="zoomFitBtn" type="button" class="secondary">Fit</button>
+            <button id="zoomInBtn" type="button" class="secondary">+</button>
+            <span id="zoomValue" class="zoom-value">100%</span>
+          </div>
+        </div>
+
+        <div id="canvasWrapper" class="canvas-wrapper">
+          <div id="canvasContent" class="canvas-content">
+            <canvas id="editorCanvas" width="1400" height="900"></canvas>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
