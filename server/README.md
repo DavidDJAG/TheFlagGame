@@ -315,7 +315,7 @@ The intended current workflow is:
 - `launchSettings.json` contains Visual Studio URLs, but the actual code uses `UseUrls("http://0.0.0.0:5770")`
 - full build validation could not be completed inside this sandbox due to `NuGet.Config` access restrictions, not because of an observed code error
 
-## Autor
+## Author
 
 **David Jorge Aguirre Grazio**  
-Desarrollador
+Developer

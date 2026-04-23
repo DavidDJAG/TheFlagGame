@@ -297,7 +297,7 @@ The active client in `client-pwa/` consumes the same map schema to:
 - if the backend is published behind a prefix, use `basePath` or `publicPath`
 - the editor can work fully offline to create JSON first and sync later
 
-## Autor
+## Author
 
 **David Jorge Aguirre Grazio**  
-Desarrollador
+Developer

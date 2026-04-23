@@ -280,7 +280,7 @@ The app uses the map JSON to:
 - [Server README](../server/README.md)
 - [Editor README](./editor/README.md)
 
-## Autor
+## Author
 
 **David Jorge Aguirre Grazio**  
-Desarrollador
+Developer

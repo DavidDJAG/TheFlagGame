@@ -911,7 +911,7 @@ After this plan, the next two immediate artifacts should be:
 
 That would already complete the full editor -> JSON file -> game backend flow.
 
-## Autor
+## Author
 
 **David Jorge Aguirre Grazio**  
-Desarrollador
+Developer

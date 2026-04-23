@@ -1151,7 +1151,7 @@ The most valuable next step is a **vertical slice** with exactly these pieces:
 
 Once that works, around 80% of the real project risk is already validated.
 
-## Autor
+## Author
 
 **David Jorge Aguirre Grazio**  
-Desarrollador
+Developer

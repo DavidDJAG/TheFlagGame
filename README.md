@@ -8,8 +8,6 @@
 - a JSON-based map format
 - PWA support for desktop and mobile installation
 
-![THE FLAG screenshot](./Making/scene.png)
-
 ## Overview
 
 **THE FLAG** is a simple top-down multiplayer prototype focused on a clear capture-the-flag gameplay loop. The server owns the real match state, while clients connect over WebSocket to receive live game snapshots and send player intent.
@@ -263,7 +261,7 @@ For more module-specific details:
 - frontend packaging or build pipeline
 - production deployment behind a reverse proxy and domain
 
-## Autor
+## Author
 
 **David Jorge Aguirre Grazio**  
-Desarrollador
+Developer
