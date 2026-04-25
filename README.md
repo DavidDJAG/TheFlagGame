@@ -2,15 +2,16 @@
 
 2D multiplayer **capture the flag** prototype built with:
 
-- a playable HTML, CSS, and JavaScript client
+- a playable HTML, CSS, and JavaScript PWA client
 - an authoritative C# ASP.NET Core backend using WebSockets
 - a web-based map editor
 - a JSON-based map format
 - PWA support for desktop and mobile installation
+- deployment support behind Nginx under `/theflag/`
 
 ## Overview
 
-**THE FLAG** is a simple top-down multiplayer prototype focused on a clear capture-the-flag gameplay loop. The server owns the real match state, while clients connect over WebSocket to receive live game snapshots and send player intent.
+**THE FLAG** is a top-down multiplayer capture-the-flag prototype. The server owns the authoritative match state, while clients connect over WebSocket to receive live snapshots and send player intent.
 
 The project also includes a dedicated map editor that can create and validate arenas, export them to JSON, and sync them directly with the backend.
 
@@ -19,27 +20,36 @@ The project also includes a dedicated map editor that can create and validate ar
 The repository currently contains three main modules:
 
 1. `server/`
-   .NET backend that simulates the match, exposes HTTP endpoints, and accepts WebSocket connections.
+   .NET backend that simulates the match, exposes HTTP endpoints, accepts WebSocket connections, logs locally, and serves the PWA client under `/pwa/` when available.
 2. `client-pwa/`
    Active playable frontend. It is a static frontend with no build pipeline.
 3. `client-pwa/editor/`
    Map editor compatible with both the backend and the playable client.
+
+The root also includes `nginx.conf`, with the current reverse-proxy routing for `/theflag/`, `/theflag/api/`, and `/theflag/ws` while preserving the other services already configured in the server.
 
 ## Main features
 
 ### Gameplay
 
 - real-time multiplayer match
-- automatic `blue` / `red` team assignment
+- automatic `blue` / `red` team assignment on connect
+- full team reassignment on **Reset match**
+- 5-minute match timer controlled by the backend
+- match-finished state with winner, loser, tie support, and final scores
 - desktop keyboard movement
 - mobile touch controls
 - authoritative shooting
 - friendly fire enabled
 - shot cooldown
-- automatic respawn
-- flag capture, carry, drop, and return
-- scoring on completed captures
-- synchronized match reset
+- automatic respawn after being hit
+- collision-aware spawn zones:
+  - red players spawn around the upper-center area of the map
+  - blue players spawn around the lower-center area of the map
+  - fallback search avoids obstacles, perimeter collisions, and occupied player positions
+- flag capture, carry, drop, return, and score
+- players can return their own dropped flag even while carrying the enemy flag
+- synchronized match reset available at any time, including after the match ends
 - basic ping measurement
 
 ### World and collisions
@@ -50,6 +60,17 @@ The repository currently contains three main modules:
 - soft player-to-player separation
 - JSON-configurable arena layout
 
+### Backend reliability
+
+- authoritative fixed-rate simulation at 20 Hz
+- non-blocking WebSocket broadcast using one outbound queue per client
+- one dedicated WebSocket writer per client
+- outbound queue uses drop-oldest behavior so slow clients do not freeze the global game loop
+- send timeout per client
+- incoming WebSocket message size limit of 16 KB
+- local `log.txt` written next to the executable
+- improved exception logging in receive, send, map persistence, client cleanup, and game-loop paths
+
 ### PWA client
 
 - installable as an app
@@ -57,6 +78,12 @@ The repository currently contains three main modules:
 - desktop and mobile support
 - portrait-mode minimap
 - responsive UI
+- HUD scoreboard for both teams
+- centered countdown timer between score bubbles
+- compact translucent top-edge score/timer HUD for mobile visibility
+- final-result overlay after the timer reaches zero
+- connection watchdog that reconnects when state snapshots stop arriving
+- automatic local team/accent refresh when the backend reassigns teams after reset
 
 ### Map editor
 
@@ -78,6 +105,7 @@ The backend lives in `server/` and currently:
 
 - loads the map from `server/Data/map.json`
 - keeps a single global match in memory
+- owns scores, flags, players, timer, shots, hit effects, and match-finished state
 - exposes:
   - `GET /health`
   - `GET /api/map`
@@ -93,7 +121,8 @@ The active client lives in `client-pwa/` and:
 - loads the map through `GET /api/map`
 - connects to the backend over WebSocket
 - renders the arena and players on a 2D canvas
-- processes `shots` and `events` emitted by the server
+- processes `shots`, `events`, scores, timer, flags, and match status emitted by the server
+- sends player input, shooting, ping, and reset requests
 
 ### Editor
 
@@ -116,20 +145,17 @@ the_flag_game/
     manifest.webmanifest
     styles.css
     sw.js
-  Graphics/
-  Making/
-    map.json
-    plan_editor_escenario.md
-    plan_juego_captura_bandera.md
   server/
     Data/
       map.json
     GameHost.cs
     Geometry.cs
+    LocalFileLoggerProvider.cs
     Models.cs
     Program.cs
     README.md
     TheFlag.Server.csproj
+  nginx.conf
   README.md
 ```
 
@@ -143,13 +169,14 @@ the_flag_game/
 - JavaScript
 - Canvas 2D
 - JSON for map definition
+- Nginx reverse proxy for production routing
 
 ## Running the project
 
 ### Requirements
 
 - Windows 10/11
-- .NET SDK compatible with `net9.0`
+- .NET SDK compatible with the project target framework
 - modern browser
 
 ### 1. Start the backend
@@ -196,6 +223,17 @@ or serve it as a static site and connect it to the backend.
 - virtual joystick on the left side
 - shoot by tapping the right half
 
+## Match flow
+
+1. Players connect and are assigned to blue/red teams.
+2. The backend starts or continues the active 5-minute match.
+3. Red players spawn near the upper-center area; blue players spawn near the lower-center area.
+4. Players can steal the enemy flag and must return it while their own flag is at base.
+5. If a player is hit while carrying a flag, the flag drops at the elimination point.
+6. A player can return their own dropped flag even while carrying the enemy flag.
+7. When the timer reaches zero, the server freezes the match and reports the winner or tie.
+8. Any connected player can press **Reset match** to start a new full match.
+
 ## Useful endpoints
 
 ### HTTP
@@ -208,6 +246,17 @@ or serve it as a static site and connect it to the backend.
 
 - `WS /ws`
 
+## Deployment notes
+
+For the included Nginx setup:
+
+- frontend URL: `https://server.mcrenox.com/theflag/`
+- API URL: `https://server.mcrenox.com/theflag/api/...`
+- WebSocket URL: `wss://server.mcrenox.com/theflag/ws`
+- backend upstream: `http://127.0.0.1:5770`
+
+The PWA detects the `/theflag` public base path and routes HTTP/WebSocket requests through that prefix.
+
 ## Recommended workflow
 
 1. Start the backend.
@@ -215,6 +264,7 @@ or serve it as a static site and connect it to the backend.
 3. Edit the arena.
 4. Save the updated map to the server.
 5. Open the PWA client and test the match.
+6. For production, serve the backend behind Nginx using the included `/theflag/` routes.
 
 ## Current limitations
 
@@ -223,7 +273,7 @@ or serve it as a static site and connect it to the backend.
 - no persistent match storage
 - no multiple rooms
 - no bots or AI
-- no explicit spawn points in the map format
+- spawn zones are computed by the server, not configured in the map JSON
 - no account or matchmaking system
 - no modern frontend build pipeline
 
@@ -241,8 +291,6 @@ The runtime uses:
 server/Data/map.json
 ```
 
-`Making/map.json` is a convenience copy, not the runtime source of truth.
-
 ## Internal documentation
 
 For more module-specific details:
@@ -254,12 +302,12 @@ For more module-specific details:
 ## Suggested roadmap
 
 - multiple rooms
-- explicit team spawns
+- map-configurable spawn zones
 - better interpolation and reconciliation
 - account or player identity system
 - richer UI and HUD
 - frontend packaging or build pipeline
-- production deployment behind a reverse proxy and domain
+- production monitoring and log rotation
 
 ## Author
 

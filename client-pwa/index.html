@@ -23,8 +23,9 @@
         </button>
       </div>
 
-      <div class="hud-center" aria-label="Scoreboard">
+      <div class="hud-center" aria-label="Scoreboard and match timer">
         <div class="score-chip blue-box">BLUE <span id="blueScore">0</span></div>
+        <div class="timer-chip" id="matchTimer" aria-live="polite">05:00</div>
         <div class="score-chip red-box">RED <span id="redScore">0</span></div>
       </div>
     </header>
@@ -105,6 +106,16 @@
     </aside>
 
     <button class="drawer-backdrop" id="drawerBackdrop" type="button" aria-label="Close menu" aria-hidden="true" tabindex="-1"></button>
+
+    <div class="match-result hidden" id="matchResult" aria-hidden="true">
+      <div class="match-result-card">
+        <div class="match-result-kicker" id="matchResultKicker">Match finished</div>
+        <strong id="matchResultTitle">Match finished</strong>
+        <span id="matchResultScores">Blue 0 - Red 0</span>
+        <p id="matchResultDetails">Open the menu or use this button to reset the match.</p>
+        <button id="matchResultResetBtn" class="secondary" type="button" disabled>Reset match</button>
+      </div>
+    </div>
 
     <div class="rotate-hint" id="rotateHint" aria-hidden="true">
       <div class="rotate-card">

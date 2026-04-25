@@ -10,6 +10,12 @@ const gameInfoLine1El = document.getElementById('gameInfoLine1');
 const pingValueEl = document.getElementById('gameInfoLine4');
 const blueScoreEl = document.getElementById('blueScore');
 const redScoreEl = document.getElementById('redScore');
+const matchTimerEl = document.getElementById('matchTimer');
+const matchResultEl = document.getElementById('matchResult');
+const matchResultTitleEl = document.getElementById('matchResultTitle');
+const matchResultScoresEl = document.getElementById('matchResultScores');
+const matchResultDetailsEl = document.getElementById('matchResultDetails');
+const matchResultResetBtn = document.getElementById('matchResultResetBtn');
 const viewportShellEl = document.getElementById('viewportShell');
 const appShellEl = document.getElementById('appShell');
 const sideDrawerEl = document.getElementById('sideDrawer');
@@ -33,6 +39,10 @@ const IMPACT_SPARK_DURATION_MS = 180;
 const RECENT_PLAYER_IMPACT_TTL_MS = 180;
 const PLAYER_IMPACT_PROXIMITY_PX = 14;
 const SEEN_EVENT_TTL_MS = 15000;
+const STATE_WATCHDOG_INTERVAL_MS = 1000;
+const STATE_WATCHDOG_TIMEOUT_MS = 5000;
+const RECONNECT_BASE_DELAY_MS = 1000;
+const RECONNECT_MAX_DELAY_MS = 5000;
 
 function normalizeBaseUrl(url) {
   return String(url || '').trim().replace(/\/+$/, '');
@@ -109,6 +119,14 @@ const state = {
   myPlayerId: null,
   myTeam: null,
   scores: { blue: 0, red: 0 },
+  match: {
+    status: 'running',
+    durationSeconds: 300,
+    remainingMs: 300000,
+    winnerTeam: null,
+    loserTeam: null,
+    isTie: false,
+  },
   players: [],
   flags: [],
   shots: [],
@@ -124,6 +142,11 @@ const state = {
   inputIntervalId: null,
   pingNonce: 1,
   pendingPings: new Map(),
+  watchdogIntervalId: null,
+  reconnectTimeoutId: null,
+  lastStateReceivedAt: null,
+  desiredOnline: false,
+  reconnectAttempts: 0,
   mobile: {
     enabled: false,
     movePointerId: null,
@@ -176,6 +199,7 @@ async function boot() {
   updateInstallAvailability();
   updateConnectButton();
   updatePingLine();
+  updateMatchHud();
   syncMenuState();
   requestAnimationFrame(renderLoop);
   registerServiceWorker();
@@ -308,18 +332,8 @@ function setupEvents() {
     closeMenu();
   });
 
-  resetGameBtn.addEventListener('click', () => {
-    if (!state.connected) {
-      return;
-    }
-
-    const accepted = window.confirm('Reset the current match? Scores, flags, and positions will be reset.');
-    if (!accepted) {
-      return;
-    }
-
-    send({ type: 'resetGame' });
-  });
+  resetGameBtn.addEventListener('click', () => requestMatchReset());
+  matchResultResetBtn.addEventListener('click', () => requestMatchReset());
 
   installAppBtn.addEventListener('click', installPwa);
 
@@ -712,6 +726,9 @@ function isTextInputFocused() {
 }
 
 function connect() {
+  state.desiredOnline = true;
+  clearReconnectTimer();
+
   if (state.socket && (state.socket.readyState === WebSocket.OPEN || state.socket.readyState === WebSocket.CONNECTING)) {
     return;
   }
@@ -725,17 +742,26 @@ function connect() {
 
   socket.addEventListener('open', () => {
     state.connected = true;
+    state.reconnectAttempts = 0;
+    state.lastStateReceivedAt = performance.now();
     setConnectionStatus('connected');
     updateConnectButton();
     closeMenu();
     send({ type: 'hello', name: playerNameInput.value.trim() || 'Player' });
     schedulePingLoop();
+    scheduleStateWatchdog();
     sendPing();
     sendCurrentInput();
   });
 
   socket.addEventListener('message', (event) => {
-    const message = JSON.parse(event.data);
+    let message;
+    try {
+      message = JSON.parse(event.data);
+    } catch (error) {
+      console.warn('Invalid WebSocket message received', error);
+      return;
+    }
     if (message.type === 'welcome') {
       state.myPlayerId = message.playerId;
       state.myTeam = message.team;
@@ -749,18 +775,26 @@ function connect() {
     }
 
     if (message.type === 'state') {
+      state.lastStateReceivedAt = performance.now();
       processServerEvents(message.events || []);
       state.players = message.players || [];
+      updateMyTeamFromState();
       state.flags = message.flags || [];
       processShotImpacts(message.shots || []);
       state.shots = message.shots || [];
       state.scores = message.scores || { blue: 0, red: 0 };
+      state.match = normalizeMatchState(message.match);
       blueScoreEl.textContent = state.scores.blue;
       redScoreEl.textContent = state.scores.red;
+      updateMatchHud();
     }
   });
 
   socket.addEventListener('close', () => {
+    const shouldReconnect = state.desiredOnline;
+    if (state.socket === socket) {
+      state.socket = null;
+    }
     state.connected = false;
     state.shots = [];
     state.shotSignatures.clear();
@@ -768,14 +802,23 @@ function connect() {
     state.seenEventIds.clear();
     state.recentPlayerImpacts = [];
     state.lastFrameTime = null;
+    state.match.status = 'running';
+    state.match.remainingMs = Math.max(0, (state.match.durationSeconds || 300) * 1000);
+    updateMatchHud();
     state.myPlayerId = null;
     state.myTeam = null;
     setConnectionStatus('disconnected');
     updateConnectButton();
     stopPingLoop();
+    stopStateWatchdog();
     resetPing();
+    state.lastStateReceivedAt = null;
     setCanvasAccent(null);
     updatePingLine();
+
+    if (shouldReconnect) {
+      scheduleReconnect();
+    }
   });
 
   socket.addEventListener('error', () => {
@@ -785,14 +828,104 @@ function connect() {
   });
 }
 
+function requestMatchReset() {
+  if (!state.connected) {
+    return;
+  }
+
+  const accepted = window.confirm('Reset the current match? Scores, flags, timer, teams, and positions will be reset.');
+  if (!accepted) {
+    return;
+  }
+
+  send({ type: 'resetGame' });
+}
+
 function disconnect() {
+  state.desiredOnline = false;
+  clearReconnectTimer();
   stopPingLoop();
+  stopStateWatchdog();
   if (state.socket) {
     state.socket.close();
   }
 }
 
+function clearReconnectTimer() {
+  if (state.reconnectTimeoutId) {
+    clearTimeout(state.reconnectTimeoutId);
+    state.reconnectTimeoutId = null;
+  }
+}
+
+function scheduleReconnect() {
+  if (!state.desiredOnline || state.reconnectTimeoutId) {
+    return;
+  }
+
+  const delay = Math.min(
+    RECONNECT_MAX_DELAY_MS,
+    RECONNECT_BASE_DELAY_MS * Math.max(1, 2 ** state.reconnectAttempts)
+  );
+  state.reconnectAttempts += 1;
+  setConnectionStatus('reconnecting');
+  updateConnectButton();
+  updatePingLine('reconnecting...');
+
+  state.reconnectTimeoutId = window.setTimeout(() => {
+    state.reconnectTimeoutId = null;
+    if (state.desiredOnline) {
+      connect();
+    }
+  }, delay);
+}
+
+function scheduleStateWatchdog() {
+  stopStateWatchdog();
+  state.watchdogIntervalId = window.setInterval(checkStateWatchdog, STATE_WATCHDOG_INTERVAL_MS);
+}
+
+function stopStateWatchdog() {
+  if (state.watchdogIntervalId) {
+    clearInterval(state.watchdogIntervalId);
+    state.watchdogIntervalId = null;
+  }
+}
+
+function checkStateWatchdog() {
+  const socket = state.socket;
+  if (!state.connected || !socket || socket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+
+  const lastStateAt = state.lastStateReceivedAt;
+  if (typeof lastStateAt !== 'number') {
+    return;
+  }
+
+  const elapsed = performance.now() - lastStateAt;
+  if (elapsed <= STATE_WATCHDOG_TIMEOUT_MS) {
+    return;
+  }
+
+  console.warn(`No state message received for ${Math.round(elapsed)} ms. Reconnecting WebSocket.`);
+  setConnectionStatus('state timeout');
+  updatePingLine('state timeout');
+  stopStateWatchdog();
+
+  try {
+    socket.close(4000, 'state watchdog timeout');
+  } catch (error) {
+    console.warn('Could not close timed-out WebSocket cleanly', error);
+    socket.close();
+  }
+}
+
 function shoot() {
+  if (state.match.status === 'finished') {
+    return;
+  }
+
   send({ type: 'shoot' });
 }
 
@@ -804,7 +937,103 @@ function send(payload) {
 }
 
 function sendCurrentInput() {
+  if (state.match.status === 'finished') {
+    return;
+  }
+
   send({ type: 'input', ...state.input });
+}
+
+function normalizeMatchState(match) {
+  const fallbackDurationSeconds = state.match.durationSeconds || 300;
+  if (!match || typeof match !== 'object') {
+    return {
+      status: 'running',
+      durationSeconds: fallbackDurationSeconds,
+      remainingMs: fallbackDurationSeconds * 1000,
+      winnerTeam: null,
+      loserTeam: null,
+      isTie: false,
+    };
+  }
+
+  const durationSeconds = Number.isFinite(match.durationSeconds) ? match.durationSeconds : fallbackDurationSeconds;
+  const remainingMs = Number.isFinite(match.remainingMs)
+    ? Math.max(0, match.remainingMs)
+    : Math.max(0, durationSeconds * 1000);
+  const status = match.status === 'finished' ? 'finished' : 'running';
+
+  return {
+    status,
+    durationSeconds,
+    remainingMs,
+    winnerTeam: match.winnerTeam || null,
+    loserTeam: match.loserTeam || null,
+    isTie: Boolean(match.isTie) || match.winnerTeam === 'draw',
+  };
+}
+
+function updateMyTeamFromState() {
+  if (!state.myPlayerId) {
+    return;
+  }
+
+  const me = state.players.find((player) => player.id === state.myPlayerId);
+  if (!me || (me.team !== 'blue' && me.team !== 'red')) {
+    return;
+  }
+
+  if (state.myTeam !== me.team) {
+    state.myTeam = me.team;
+    setCanvasAccent(me.team);
+  }
+}
+
+function formatMatchTime(ms) {
+  const totalSeconds = Math.max(0, Math.ceil(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return String(minutes).padStart(2, '0') + ':' + String(seconds).padStart(2, '0');
+}
+
+function formatTeamName(team) {
+  if (team === 'blue') {
+    return 'BLUE';
+  }
+  if (team === 'red') {
+    return 'RED';
+  }
+  return 'DRAW';
+}
+
+function updateMatchHud() {
+  const match = state.match || {};
+  const isFinished = match.status === 'finished';
+  const blueScore = Number.isFinite(state.scores.blue) ? state.scores.blue : 0;
+  const redScore = Number.isFinite(state.scores.red) ? state.scores.red : 0;
+
+  matchTimerEl.textContent = formatMatchTime(match.remainingMs || 0);
+  matchTimerEl.classList.toggle('finished', isFinished);
+
+  matchResultEl.classList.toggle('hidden', !isFinished);
+  matchResultEl.setAttribute('aria-hidden', isFinished ? 'false' : 'true');
+
+  if (!isFinished) {
+    return;
+  }
+
+  matchResultScoresEl.textContent = 'Blue ' + blueScore + ' - Red ' + redScore;
+
+  if (match.isTie || match.winnerTeam === 'draw') {
+    matchResultTitleEl.textContent = 'Draw';
+    matchResultDetailsEl.textContent = 'No winner. Final score: Blue ' + blueScore + ' - Red ' + redScore + '. Press Reset match to start again.';
+    return;
+  }
+
+  const winner = formatTeamName(match.winnerTeam);
+  const loser = formatTeamName(match.loserTeam);
+  matchResultTitleEl.textContent = winner + ' wins';
+  matchResultDetailsEl.textContent = 'Winner: ' + winner + '. Loser: ' + loser + '. Press Reset match to start again.';
 }
 
 function setConnectionStatus(value) {
@@ -816,6 +1045,7 @@ function updateConnectButton() {
   const isOnline = socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING);
   connectToggleBtn.textContent = isOnline ? 'Disconnect' : 'Connect';
   resetGameBtn.disabled = !state.connected;
+  matchResultResetBtn.disabled = !state.connected;
 }
 
 function updateInstallAvailability() {

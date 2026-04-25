@@ -1,4 +1,6 @@
 using System.Text.Json.Serialization;
+using System.Threading.Channels;
+
 
 namespace TheFlag.Server;
 
@@ -93,7 +95,7 @@ public sealed class PlayerRuntime
 {
     public required string Id { get; init; }
     public required string Name { get; set; }
-    public required string Team { get; init; }
+    public required string Team { get; set; }
     public Vec2 Position { get; set; }
     public Vec2 SpawnPosition { get; set; }
     public Vec2 Facing { get; set; } = new(1f, 0f);
@@ -136,9 +138,53 @@ public sealed class HitEffectRuntime
 
 public sealed class ConnectedClient
 {
+    private const int OutboundQueueCapacity = 8;
+    private int _stopRequested;
+
+    public ConnectedClient()
+    {
+        Outbound = Channel.CreateBounded<string>(new BoundedChannelOptions(OutboundQueueCapacity)
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            FullMode = BoundedChannelFullMode.DropOldest,
+            AllowSynchronousContinuations = false
+        });
+    }
+
     public required string PlayerId { get; init; }
     public required System.Net.WebSockets.WebSocket Socket { get; init; }
     public long? PendingPongNonce { get; set; }
+    public Channel<string> Outbound { get; }
+    public CancellationTokenSource SendCancellation { get; } = new();
+    public Task? WriterTask { get; set; }
+    public bool IsStopRequested => Volatile.Read(ref _stopRequested) != 0;
+
+    public bool TryQueueRawJson(string payload)
+    {
+        if (IsStopRequested)
+        {
+            return false;
+        }
+
+        return Outbound.Writer.TryWrite(payload);
+    }
+
+    public void Stop(bool abortSocket)
+    {
+        if (Interlocked.Exchange(ref _stopRequested, 1) != 0)
+        {
+            return;
+        }
+
+        Outbound.Writer.TryComplete();
+        SendCancellation.Cancel();
+
+        if (abortSocket)
+        {
+            Socket.Abort();
+        }
+    }
 }
 
 

@@ -18,8 +18,11 @@ The app currently includes:
 - rendering for players, flags, shot traces, and hit effects
 - side drawer with match information
 - desktop and mobile controls
-- basic ping measurement
-- match reset button
+- live ping measurement
+- connection watchdog and automatic reconnect when state snapshots stop arriving
+- match reset button usable at any time
+- 5-minute countdown timer in the top HUD
+- final-result overlay with winner/loser/tie and scores
 - installable PWA support
 - service worker for app-shell caching
 - responsive layout with portrait-specific mobile behavior
@@ -58,7 +61,8 @@ When the player clicks **Connect**:
 2. it sends `hello` with the player name
 3. it starts sending `input`
 4. it receives `welcome`
-5. it processes `state` snapshots with players, scores, flags, shots, and events
+5. it processes `state` snapshots with players, scores, flags, shots, events, and match timer data
+6. it starts the watchdog that expects regular state snapshots from the backend
 
 ## Features
 
@@ -68,9 +72,14 @@ When the player clicks **Connect**:
 - authoritative shooting
 - own-team visual identification
 - blue/red scoreboard
+- centered match timer between score bubbles
+- compact translucent top-edge score/timer HUD to reduce obstruction on mobile
 - player names
 - shot cooldown display support
 - real-time match state updates
+- final-result overlay when the server marks the match as finished
+- **Reset Match** sends `resetGame`, which resets scores, flags, timer, teams, and positions on the backend
+- local player team/accent updates when the backend reassigns teams after reset
 
 ### Visual effects
 
@@ -87,7 +96,9 @@ When the player clicks **Connect**:
 - editable player name
 - connect / disconnect button
 - PWA install button when supported
-- **Reset Match** button
+- **Reset Match** button in the side menu
+- **Reset Match** button in the final-result overlay
+- timer changes style when the match is finished
 
 ### Responsive and mobile
 
@@ -96,6 +107,12 @@ When the player clicks **Connect**:
 - firing zone on the right
 - layout adapted to smaller screens
 - portrait mode uses a vertical camera plus minimap to preserve world awareness
+
+### Connection watchdog
+
+The client tracks the time of the last `state` snapshot. If no state arrives for several seconds while the socket still appears open, the client closes the WebSocket and lets the normal reconnect flow create a new connection.
+
+This protects the UI from staying frozen forever if the network, proxy, or socket enters a half-open state.
 
 ## Controls
 
@@ -137,6 +154,14 @@ file:///C:/path/client-pwa/index.html?server=http://127.0.0.1:5770
 https://example.com/theflag/?server=https://example.com&basePath=/theflag
 ```
 
+When published behind Nginx under `/theflag/`, the client can use:
+
+```text
+https://server.mcrenox.com/theflag/
+```
+
+and it will route API and WebSocket traffic through the same public prefix.
+
 ## Endpoints consumed by the app
 
 ### HTTP
@@ -146,6 +171,11 @@ https://example.com/theflag/?server=https://example.com&basePath=/theflag
 ### WebSocket
 
 - `WS /ws`
+
+When deployed under `/theflag/`, these effectively become:
+
+- `GET /theflag/api/map`
+- `WS /theflag/ws`
 
 ## Network messages
 
@@ -174,7 +204,18 @@ https://example.com/theflag/?server=https://example.com&basePath=/theflag
 ```json
 {
   "type": "state",
+  "serverTime": 1710000000000,
   "scores": { "blue": 0, "red": 0 },
+  "match": {
+    "status": "running",
+    "durationSeconds": 300,
+    "startedAt": 1710000000000,
+    "endsAt": 1710000300000,
+    "remainingMs": 299500,
+    "winnerTeam": null,
+    "loserTeam": null,
+    "isTie": false
+  },
   "players": [],
   "flags": [],
   "shots": [],
@@ -188,6 +229,22 @@ https://example.com/theflag/?server=https://example.com&basePath=/theflag
   "nonce": 1
 }
 ```
+
+The client uses the `match` object to render the countdown timer and the final-result overlay.
+
+## Match timer and result display
+
+The server controls the timer. The frontend only displays the `remainingMs` value sent in `state.match`.
+
+- default duration: `300` seconds
+- display format: `M:SS`
+- when `status` becomes `finished`, movement and shooting are no longer useful until reset
+- final overlay shows:
+  - winner team
+  - loser team
+  - tie state if applicable
+  - final Blue/Red score
+  - reset button to start a new match
 
 ## PWA support
 
@@ -252,6 +309,8 @@ The app uses the map JSON to:
 - place flags
 - adjust camera framing and scene presentation
 
+Spawn zones are not drawn from map JSON. They are computed by the backend and reflected through player positions in the live state snapshots.
+
 ## Related folders
 
 - `editor/`: the project's map editor
@@ -272,7 +331,8 @@ The app uses the map JSON to:
 1. Run the backend in `server/`
 2. Open `http://127.0.0.1:5770/pwa/`
 3. Connect one or more clients
-4. Optionally edit the map from `client-pwa/editor/`
+4. Play until the timer ends, or press **Reset Match** to restart immediately
+5. Optionally edit the map from `client-pwa/editor/`
 
 ## Related documentation
 

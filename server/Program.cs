@@ -2,6 +2,7 @@ using TheFlag.Server;
 using Microsoft.Extensions.FileProviders;
 
 var builder = WebApplication.CreateSlimBuilder(args);
+builder.Logging.AddProvider(new LocalFileLoggerProvider(Path.Combine(AppContext.BaseDirectory, "log.txt")));
 builder.WebHost.UseUrls("http://0.0.0.0:5770");
 builder.Services.ConfigureHttpJsonOptions(options =>
 {

@@ -179,6 +179,11 @@ Behavior depends on the save target:
 
 Remember that the current backend rejects map saves while players are connected.
 
+
+## Spawn-zone note
+
+The editor currently defines the map perimeter, obstacles, and flag positions only. Player spawn zones are not part of the JSON schema yet. The backend computes them procedurally: red players spawn near the upper-center area of the map and blue players spawn near the lower-center area, with collision-aware fallback searches.
+
 ## JSON format produced by the editor
 
 The editor exports a document with this general structure:

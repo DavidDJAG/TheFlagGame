@@ -4,27 +4,23 @@ Authoritative backend for the **THE FLAG** multiplayer prototype. This folder co
 
 - loads the map from `server/Data/map.json`
 - keeps the state of a single in-memory match
-- simulates movement, collisions, flags, shooting, and respawn
+- simulates movement, collisions, flags, shooting, respawn, scoring, and match timing
 - exposes `GET /health`, `GET /api/map`, `PUT /api/map`, and `WS /ws`
 - serves the current PWA client under `/pwa` when the `client-pwa` folder exists
+- writes local logs to `log.txt` next to the executable
 
 ## Current state
 
 The project currently consists of three main pieces:
 
 1. `server/`
-   .NET 9 backend with WebSocket and authoritative simulation.
+   .NET backend with WebSocket and authoritative simulation.
 2. `client-pwa/`
    Playable HTML/CSS/JavaScript frontend. This is the active client.
 3. `client-pwa/editor/`
    Static editor used to create or modify `map.json` and sync it with the server.
 
-Additional material in the repository:
-
-- `Making/map.json`: convenience copy of the current map. The runtime still uses `server/Data/map.json`.
-- `Graphics/`: logos, icons, and historical variants.
-- `client-pwa/old/`: legacy client kept for reference.
-- `Making/plan_editor_escenario.md`, `Making/plan_juego_captura_bandera.md`, `Making/scene.png`: planning notes and visual support files.
+The root package also includes `nginx.conf`, which routes the production `/theflag/` frontend, `/theflag/api/` HTTP API, and `/theflag/ws` WebSocket endpoint to this backend while preserving other configured services.
 
 ## What the backend currently does
 
@@ -32,9 +28,11 @@ Additional material in the repository:
 
 - fixed `20` Hz tick rate
 - single global in-memory match
-- automatic `blue` / `red` team assignment
-- initial spawn calculated around the team's own flag
-- respawn around the original spawn when the preferred point is occupied
+- automatic `blue` / `red` team assignment on connect
+- balanced randomized team reassignment on `resetGame`
+- 5-minute match clock owned by the server
+- match-finished state when the timer reaches zero
+- winner/loser/tie calculation from final scores
 - movement driven by discrete directional input
 - collisions against:
   - perimeter
@@ -43,14 +41,27 @@ Additional material in the repository:
   - polygons
 - soft separation between overlapping players
 
+### Spawn rules
+
+- red players spawn in the upper-center area of the map
+- blue players spawn in the lower-center area of the map
+- the server first tries the preferred team zone
+- if the ideal area is blocked, it searches nearby collision-free points
+- if the preferred zone is unavailable, it searches the corresponding team half
+- the legacy flag-adjacent spawn is used only as a final fallback
+- spawn checks avoid hard world collisions and occupied players
+- spawn zones are procedural and are not currently stored in `map.json`
+
 ### Objective and rules
 
 - each team owns a home flag
 - a player can pick up the enemy flag by moving close to it
-- the home flag can be returned if it was dropped
+- a player carrying the enemy flag can still return their own dropped flag by touching it
 - a team scores when a player brings the enemy flag back while the home flag is at base
 - if a player dies while carrying a flag, the flag drops at the elimination point
-- `resetGame` resets scores, flags, inputs, cooldowns, and positions
+- if a player disconnects while carrying a flag, that flag is reset to base
+- `resetGame` fully resets scores, flags, inputs, cooldowns, shots, effects, timer, teams, and player positions
+- `resetGame` can be used during an active match or after a match has finished
 
 ### Combat
 
@@ -62,17 +73,39 @@ Additional material in the repository:
 - immediate respawn on hit
 - **friendly fire is enabled**: the server does not filter teammates when resolving hits
 
-### Network state
+### Network reliability
 
-- `welcome` message on connect with `playerId`, `team`, `tickRate`, and `mapName`
-- `state` snapshots containing:
-  - `scores`
-  - `players`
-  - `flags`
-  - `shots`
-  - `events`
-  - `serverTime`
-- basic latency support through `ping` and `pong`
+The backend uses a non-blocking WebSocket broadcast model:
+
+- the game loop builds one state payload per tick
+- each connected client has its own bounded outbound queue
+- each connected client has a dedicated writer task
+- the game loop enqueues snapshots instead of awaiting every `SendAsync`
+- if a client is slow, the queue drops the oldest outbound state instead of freezing the match
+- each WebSocket send has a 2-second timeout
+- clients with failed or timed-out writers are removed without stopping the match
+- incoming WebSocket messages are limited to 16 KB
+- invalid JSON and unexpected message-processing failures are logged instead of being silently discarded
+
+### Logging
+
+`Program.cs` registers `LocalFileLoggerProvider`, which writes to:
+
+```text
+<exe-folder>/log.txt
+```
+
+The logger records:
+
+- startup and game-loop lifecycle messages
+- map persistence errors
+- client connect/remove events
+- WebSocket receive and writer failures
+- rejected oversized or invalid WebSocket messages
+- unexpected game-loop tick exceptions
+- match reset and match finished events
+
+No log rotation is implemented yet.
 
 ## Actual folder structure
 
@@ -82,14 +115,15 @@ server/
     map.json
   Properties/
     launchSettings.json
-    PublishProfiles/
   GameHost.cs
   Geometry.cs
+  LocalFileLoggerProvider.cs
   Models.cs
   Program.cs
   TheFlag.Server.csproj
   TheFlag.Server.sln
   icon.ico
+  README.md
 ```
 
 ## Running locally
@@ -97,7 +131,7 @@ server/
 ### Requirements
 
 - Windows 10/11
-- .NET 9 SDK or newer capable of building `net9.0`
+- .NET SDK compatible with the project target framework
 - modern browser
 
 ### Start the server
@@ -159,7 +193,7 @@ Replaces the full map as long as no players are connected.
 - requires the full map JSON
 - validates minimum structure before persisting
 - persists to `server/Data/map.json`
-- resets scores, shot traces, and hit effects
+- resets scores, shot traces, hit effects, and match clock
 - returns `409 Conflict` if players are currently connected
 
 Example success response:
@@ -198,10 +232,11 @@ Details:
 
 - `hello` changes the visible player name
 - names are truncated to 24 characters
-- `input` updates the current directional state
-- `shoot` queues a shot for the next simulation tick
+- `input` updates the current directional state while the match is running
+- `shoot` queues a shot for the next simulation tick while the match is running
 - `ping` is answered with `pong`
-- `resetGame` resets the match for everyone
+- `resetGame` starts a fresh match for everyone and reassigns teams
+- movement and shooting are ignored after the match has finished until `resetGame` is received
 
 ### Server -> client
 
@@ -224,10 +259,50 @@ State snapshot:
   "type": "state",
   "serverTime": 1710000000000,
   "scores": { "blue": 0, "red": 0 },
+  "match": {
+    "status": "running",
+    "durationSeconds": 300,
+    "startedAt": 1710000000000,
+    "endsAt": 1710000300000,
+    "remainingMs": 299500,
+    "winnerTeam": null,
+    "loserTeam": null,
+    "isTie": false
+  },
   "players": [],
   "flags": [],
   "shots": [],
   "events": []
+}
+```
+
+Finished match snapshot example:
+
+```json
+{
+  "match": {
+    "status": "finished",
+    "durationSeconds": 300,
+    "remainingMs": 0,
+    "winnerTeam": "blue",
+    "loserTeam": "red",
+    "isTie": false
+  },
+  "scores": { "blue": 3, "red": 1 }
+}
+```
+
+Tie example:
+
+```json
+{
+  "match": {
+    "status": "finished",
+    "remainingMs": 0,
+    "winnerTeam": "draw",
+    "loserTeam": null,
+    "isTie": true
+  }
 }
 ```
 
@@ -278,6 +353,8 @@ It also consumes these obstacle types:
 
 `meta.canvas.width` and `meta.canvas.height` define the logical world size.
 
+Spawn zones are not part of the current map schema. They are calculated by the backend from the canvas dimensions and team color.
+
 ## Included map
 
 The repository currently ships with:
@@ -285,6 +362,24 @@ The repository currently ships with:
 - name: `Blaze Field`
 - canvas: `1800 x 950`
 - generated at: `2026-04-21T11:35:31.337Z`
+
+## Nginx deployment
+
+The included root `nginx.conf` expects the backend at:
+
+```text
+http://127.0.0.1:5770
+```
+
+The relevant public routes are:
+
+```text
+https://server.mcrenox.com/theflag/
+https://server.mcrenox.com/theflag/api/...
+wss://server.mcrenox.com/theflag/ws
+```
+
+The WebSocket route forwards `Upgrade` and `Connection`, disables proxy buffering, and uses long read/send timeouts.
 
 ## Real limitations today
 
@@ -297,6 +392,7 @@ The repository currently ships with:
 - no friendly-fire filter
 - no advanced interpolation or reconciliation in the backend
 - no hot map reload while players are connected
+- no log rotation for `log.txt`
 
 ## Relationship with the editor
 
@@ -311,9 +407,9 @@ The intended current workflow is:
 ## Operational notes
 
 - match state is lost when the process restarts
-- `Making/map.json` is not the runtime source of truth
+- `Making/map.json`, if present in older working copies, is not the runtime source of truth
 - `launchSettings.json` contains Visual Studio URLs, but the actual code uses `UseUrls("http://0.0.0.0:5770")`
-- full build validation could not be completed inside this sandbox due to `NuGet.Config` access restrictions, not because of an observed code error
+- `log.txt` is created in `AppContext.BaseDirectory`, which is normally the folder that contains the executable or published app binaries
 
 ## Author
 

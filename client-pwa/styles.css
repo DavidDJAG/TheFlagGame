@@ -61,7 +61,7 @@ input {
 .top-hud {
   position: absolute;
   inset: 0;
-  z-index: 20;
+  z-index: 30;
   pointer-events: none;
 }
 
@@ -81,10 +81,11 @@ input {
 }
 
 .hud-center {
-  top: calc(var(--safe-top) + 10px);
+  top: var(--safe-top);
   left: 50%;
   transform: translateX(-50%);
   justify-content: center;
+  gap: 8px;
 }
 
 .icon-button {
@@ -126,13 +127,13 @@ input {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  min-height: 40px;
-  padding: 9px 12px;
-  border-radius: 14px;
-  border: 1px solid rgba(194, 205, 246, 0.22);
-  background: rgba(9, 17, 40, 0.62);
-  backdrop-filter: blur(8px);
-  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.22);
+  min-height: 38px;
+  padding: 8px 11px;
+  border-radius: 13px;
+  border: 1px solid rgba(194, 205, 246, 0.14);
+  background: rgba(9, 17, 40, 0.38);
+  backdrop-filter: blur(5px);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.14);
   white-space: nowrap;
   font-size: 15px;
   font-weight: 900;
@@ -143,14 +144,39 @@ input {
   font-size: 18px;
 }
 
+.timer-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 80px;
+  min-height: 38px;
+  padding: 8px 13px;
+  border-radius: 13px;
+  border: 1px solid rgba(194, 205, 246, 0.16);
+  background: rgba(9, 17, 40, 0.42);
+  color: var(--text);
+  backdrop-filter: blur(5px);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.14);
+  font-variant-numeric: tabular-nums;
+  font-size: 18px;
+  font-weight: 950;
+  letter-spacing: 0.08em;
+}
+
+.timer-chip.finished {
+  color: #ffd78a;
+  border-color: rgba(255, 215, 138, 0.34);
+  background: linear-gradient(180deg, rgba(104, 74, 19, 0.34), rgba(49, 34, 11, 0.24));
+}
+
 .blue-box {
   color: var(--blue);
-  background: linear-gradient(180deg, rgba(20, 47, 112, 0.42), rgba(13, 29, 72, 0.34));
+  background: linear-gradient(180deg, rgba(20, 47, 112, 0.28), rgba(13, 29, 72, 0.20));
 }
 
 .red-box {
   color: var(--red);
-  background: linear-gradient(180deg, rgba(95, 19, 33, 0.46), rgba(55, 14, 22, 0.32));
+  background: linear-gradient(180deg, rgba(95, 19, 33, 0.30), rgba(55, 14, 22, 0.20));
 }
 
 .main-stage {
@@ -541,6 +567,67 @@ body.menu-open .drawer-backdrop {
   transform: rotate(45deg);
 }
 
+.match-result {
+  position: absolute;
+  inset: 0;
+  z-index: 25;
+  display: grid;
+  place-items: center;
+  padding: calc(var(--safe-top) + 18px) calc(var(--safe-right) + 18px) calc(var(--safe-bottom) + 18px) calc(var(--safe-left) + 18px);
+  background: rgba(3, 7, 18, 0.38);
+  pointer-events: auto;
+}
+
+.match-result.hidden {
+  display: none;
+}
+
+.match-result-card {
+  width: min(420px, 92vw);
+  border: 1px solid var(--line-strong);
+  border-radius: 22px;
+  padding: 24px;
+  text-align: center;
+  background: linear-gradient(180deg, rgba(12, 24, 52, 0.96), rgba(6, 11, 29, 0.94));
+  box-shadow: 0 24px 68px rgba(0, 0, 0, 0.42);
+  backdrop-filter: blur(12px);
+}
+
+.match-result-kicker {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}
+
+.match-result-card strong {
+  display: block;
+  font-size: 34px;
+  line-height: 1.05;
+  margin-bottom: 10px;
+}
+
+.match-result-card span {
+  display: block;
+  color: var(--text);
+  font-size: 18px;
+  font-weight: 900;
+  margin-bottom: 8px;
+}
+
+.match-result-card p {
+  margin: 0 0 18px;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.match-result-card button {
+  width: 100%;
+}
+
 .rotate-hint {
   display: none !important;
 }
@@ -555,15 +642,24 @@ body.portrait-playable .canvas-wrap {
   border-radius: 16px;
 }
 
-body.portrait-playable .hud-left,
-body.portrait-playable .hud-center {
+body.portrait-playable .hud-left {
   top: calc(var(--safe-top) + 8px);
 }
 
-body.portrait-playable .score-chip {
+body.portrait-playable .hud-center {
+  top: var(--safe-top);
+}
+
+body.portrait-playable .score-chip,
+body.portrait-playable .timer-chip {
   min-height: 34px;
   padding: 7px 10px;
   border-radius: 12px;
+}
+
+body.portrait-playable .timer-chip {
+  min-width: 74px;
+  font-size: 16px;
 }
 
 @media (max-width: 760px) {
@@ -575,6 +671,14 @@ body.portrait-playable .score-chip {
   }
 
   .score-chip span {
+    font-size: 16px;
+  }
+
+  .timer-chip {
+    min-width: 74px;
+    min-height: 36px;
+    padding: 7px 10px;
+    border-radius: 12px;
     font-size: 16px;
   }
 

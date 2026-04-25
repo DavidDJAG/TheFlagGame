@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
@@ -12,6 +11,10 @@ public sealed class GameHost
     private const float ShotCooldownSeconds = 0.25f;
     private const float ShotTraceLifetimeSeconds = 0.12f;
     private const float HitEffectLifetimeSeconds = 0.35f;
+    private const int MaxIncomingMessageBytes = 16 * 1024;
+    private const int MatchDurationSeconds = 5 * 60;
+    private static readonly TimeSpan ClientSendTimeout = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan MatchDuration = TimeSpan.FromSeconds(MatchDurationSeconds);
 
     private readonly ILogger _logger;
     private readonly string _mapPath;
@@ -32,6 +35,11 @@ public sealed class GameHost
     private Task? _loopTask;
     private int _blueScore;
     private int _redScore;
+    private DateTimeOffset _matchStartedAtUtc;
+    private DateTimeOffset _matchEndsAtUtc;
+    private bool _matchFinished;
+    private string? _winnerTeam;
+    private string? _loserTeam;
 
     public GameHost(string mapPath, ILogger logger)
     {
@@ -39,6 +47,7 @@ public sealed class GameHost
         _mapPath = mapPath;
         Map = LoadMapFromFile(mapPath);
         RawMapJson = Map.RawJson;
+        StartNewMatchClock(DateTimeOffset.UtcNow);
     }
 
     public int TickRate => 20;
@@ -124,12 +133,32 @@ public sealed class GameHost
     public void Stop()
     {
         _cts.Cancel();
+
+        List<ConnectedClient> clients;
+        lock (_sync)
+        {
+            clients = _clients.Values.ToList();
+        }
+
+        foreach (var client in clients)
+        {
+            try
+            {
+                client.Stop(abortSocket: true);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Could not stop WebSocket client resources for {PlayerId}.", client.PlayerId);
+            }
+        }
+
         try
         {
             _loopTask?.Wait(TimeSpan.FromSeconds(2));
         }
-        catch
+        catch (Exception ex)
         {
+            _logger.LogWarning(ex, "The game loop did not stop cleanly.");
         }
     }
 
@@ -142,9 +171,15 @@ public sealed class GameHost
         string name;
         string mapName;
         Vec2 spawn;
+        ConnectedClient client;
 
         lock (_sync)
         {
+            if (_players.Count == 0)
+            {
+                ResetMatch();
+            }
+
             playerId = $"p-{Guid.NewGuid():N}";
             team = ChooseTeam();
             name = team == "blue" ? $"Blue-{_players.Count + 1}" : $"Red-{_players.Count + 1}";
@@ -158,26 +193,37 @@ public sealed class GameHost
                 SpawnPosition = spawn,
                 Facing = team == "blue" ? new Vec2(1f, 0f) : new Vec2(-1f, 0f)
             };
-            _clients[playerId] = new ConnectedClient
+
+            client = new ConnectedClient
             {
                 PlayerId = playerId,
                 Socket = socket
             };
+            _clients[playerId] = client;
             mapName = Map.Source.Meta.Name;
         }
 
+        client.WriterTask = Task.Run(() => ClientWriterLoopAsync(client));
         _logger.LogInformation("Client connected {PlayerId} ({Team})", playerId, team);
 
-        await SendJsonAsync(socket, new
+        if (!TryQueueJson(client, new
         {
             type = "welcome",
             playerId,
             team,
             tickRate = TickRate,
             mapName
-        }, context.RequestAborted);
+        }))
+        {
+            _logger.LogWarning("Could not queue welcome message for {PlayerId}. Closing connection.", playerId);
+            RemoveClient(playerId, abortSocket: true);
+            return;
+        }
 
-        await SendStateToAsync(playerId, context.RequestAborted);
+        SendStateTo(playerId);
+
+        var closeStatus = WebSocketCloseStatus.NormalClosure;
+        var closeDescription = "bye";
 
         try
         {
@@ -192,23 +238,38 @@ public sealed class GameHost
                 HandleIncomingMessage(playerId, message);
             }
         }
-        catch (OperationCanceledException)
+        catch (InvalidDataException ex)
         {
+            closeStatus = WebSocketCloseStatus.MessageTooBig;
+            closeDescription = "incoming message too large or invalid";
+            _logger.LogWarning(ex, "Rejected WebSocket message from {PlayerId}.", playerId);
         }
-        catch (WebSocketException)
+        catch (OperationCanceledException ex)
         {
+            _logger.LogInformation(ex, "WebSocket receive loop canceled for {PlayerId}.", playerId);
+        }
+        catch (WebSocketException ex)
+        {
+            _logger.LogWarning(ex, "WebSocket receive failed for {PlayerId}.", playerId);
+        }
+        catch (Exception ex)
+        {
+            closeStatus = WebSocketCloseStatus.InternalServerError;
+            closeDescription = "server error";
+            _logger.LogError(ex, "Unexpected error while handling WebSocket client {PlayerId}.", playerId);
         }
         finally
         {
-            RemoveClient(playerId);
+            RemoveClient(playerId, abortSocket: false);
             if (socket.State == WebSocketState.Open || socket.State == WebSocketState.CloseReceived)
             {
                 try
                 {
-                    await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None);
+                    await socket.CloseAsync(closeStatus, closeDescription, CancellationToken.None);
                 }
-                catch
+                catch (Exception ex)
                 {
+                    _logger.LogWarning(ex, "Could not close WebSocket cleanly for {PlayerId}.", playerId);
                 }
             }
         }
@@ -225,6 +286,16 @@ public sealed class GameHost
             if (result.MessageType == WebSocketMessageType.Close)
             {
                 return null;
+            }
+
+            if (result.MessageType != WebSocketMessageType.Text)
+            {
+                throw new InvalidDataException($"Unsupported WebSocket message type: {result.MessageType}.");
+            }
+
+            if (ms.Length + result.Count > MaxIncomingMessageBytes)
+            {
+                throw new InvalidDataException($"Incoming WebSocket message exceeded {MaxIncomingMessageBytes} bytes.");
             }
 
             ms.Write(buffer, 0, result.Count);
@@ -268,17 +339,23 @@ public sealed class GameHost
                 }
                 else if (type == "input")
                 {
-                    player.Input = new InputState
+                    if (!_matchFinished)
                     {
-                        Up = ReadBool(doc.RootElement, "up"),
-                        Down = ReadBool(doc.RootElement, "down"),
-                        Left = ReadBool(doc.RootElement, "left"),
-                        Right = ReadBool(doc.RootElement, "right")
-                    };
+                        player.Input = new InputState
+                        {
+                            Up = ReadBool(doc.RootElement, "up"),
+                            Down = ReadBool(doc.RootElement, "down"),
+                            Left = ReadBool(doc.RootElement, "left"),
+                            Right = ReadBool(doc.RootElement, "right")
+                        };
+                    }
                 }
                 else if (type == "shoot")
                 {
-                    player.PendingShoot = true;
+                    if (!_matchFinished)
+                    {
+                        player.PendingShoot = true;
+                    }
                 }
                 else if (type == "ping")
                 {
@@ -294,8 +371,13 @@ public sealed class GameHost
                 }
             }
         }
-        catch (JsonException)
+        catch (JsonException ex)
         {
+            _logger.LogWarning(ex, "Invalid JSON received from {PlayerId}.", playerId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Unexpected error while processing a message from {PlayerId}.", playerId);
         }
     }
 
@@ -311,76 +393,108 @@ public sealed class GameHost
 
         while (!_cts.IsCancellationRequested)
         {
-            var now = DateTime.UtcNow;
-            var dt = (float)(now - last).TotalSeconds;
-            if (dt <= 0f)
+            try
             {
-                dt = tickMs / 1000f;
-            }
-            if (dt > 0.1f)
-            {
-                dt = 0.1f;
-            }
-            last = now;
-
-            string payload;
-            List<(string PlayerId, WebSocket Socket, long? PendingPongNonce)> sockets;
-
-            lock (_sync)
-            {
-                Simulate(dt);
-                payload = BuildStatePayload();
-                sockets = _clients.Values
-                    .Where(c => c.Socket.State == WebSocketState.Open)
-                    .Select(c =>
-                    {
-                        var pendingPongNonce = c.PendingPongNonce;
-                        c.PendingPongNonce = null;
-                        return (c.PlayerId, c.Socket, pendingPongNonce);
-                    })
-                    .ToList();
-            }
-
-            var deadClients = new ConcurrentBag<string>();
-            await Task.WhenAll(sockets.Select(async item =>
-            {
-                try
+                var now = DateTime.UtcNow;
+                var dt = (float)(now - last).TotalSeconds;
+                if (dt <= 0f)
                 {
-                    if (item.PendingPongNonce is not null)
-                    {
-                        await SendJsonAsync(item.Socket, new
+                    dt = tickMs / 1000f;
+                }
+                if (dt > 0.1f)
+                {
+                    dt = 0.1f;
+                }
+                last = now;
+
+                string payload;
+                List<(ConnectedClient Client, long? PendingPongNonce)> clients;
+
+                lock (_sync)
+                {
+                    Simulate(dt);
+                    payload = BuildStatePayload();
+                    clients = _clients.Values
+                        .Select(c =>
                         {
-                            type = "pong",
-                            nonce = item.PendingPongNonce.Value
-                        }, _cts.Token);
+                            var pendingPongNonce = c.PendingPongNonce;
+                            c.PendingPongNonce = null;
+                            return (Client: c, PendingPongNonce: pendingPongNonce);
+                        })
+                        .ToList();
+                }
+
+                var deadClients = new List<string>();
+
+                foreach (var item in clients)
+                {
+                    var client = item.Client;
+                    if (client.Socket.State != WebSocketState.Open || client.IsStopRequested)
+                    {
+                        deadClients.Add(client.PlayerId);
+                        continue;
                     }
 
-                    await SendRawJsonAsync(item.Socket, payload, _cts.Token);
-                }
-                catch
-                {
-                    deadClients.Add(item.PlayerId);
-                }
-            }));
+                    if (item.PendingPongNonce is not null && !TryQueueJson(client, new
+                    {
+                        type = "pong",
+                        nonce = item.PendingPongNonce.Value
+                    }))
+                    {
+                        deadClients.Add(client.PlayerId);
+                        continue;
+                    }
 
-            foreach (var playerId in deadClients.Distinct())
+                    if (!client.TryQueueRawJson(payload))
+                    {
+                        deadClients.Add(client.PlayerId);
+                    }
+                }
+
+                foreach (var playerId in deadClients.Distinct())
+                {
+                    RemoveClient(playerId, abortSocket: true);
+                }
+            }
+            catch (OperationCanceledException) when (_cts.IsCancellationRequested)
             {
-                RemoveClient(playerId);
+                break;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unhandled exception in the game loop tick.");
             }
 
             try
             {
                 await Task.Delay(tickMs, _cts.Token);
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (_cts.IsCancellationRequested)
             {
                 break;
             }
         }
+
+        _logger.LogInformation("Game loop stopped.");
     }
 
     private void Simulate(float dt)
     {
+        UpdateMatchClock(DateTimeOffset.UtcNow);
+
+        if (_matchFinished)
+        {
+            foreach (var player in _players.Values)
+            {
+                player.Input = new InputState();
+                player.PendingShoot = false;
+            }
+
+            UpdateShotTraces(dt);
+            UpdateHitEffects(dt);
+            return;
+        }
+
         foreach (var player in _players.Values)
         {
             if (player.ShootCooldownRemaining > 0f)
@@ -431,6 +545,8 @@ public sealed class GameHost
         _redScore = 0;
         _shotTraces.Clear();
         _hitEffects.Clear();
+        StartNewMatchClock(DateTimeOffset.UtcNow);
+        ReassignPlayerTeams();
 
         foreach (var flag in Map.FlagsByTeam.Values)
         {
@@ -439,13 +555,104 @@ public sealed class GameHost
 
         foreach (var player in _players.Values)
         {
-            player.Position = player.SpawnPosition;
+            var spawn = FindSpawn(player.Team, player.Id);
+            player.Position = spawn;
+            player.SpawnPosition = spawn;
             player.Facing = player.Team == "blue" ? new Vec2(1f, 0f) : new Vec2(-1f, 0f);
             player.Input = new InputState();
             player.CarryingFlagTeam = null;
             player.ShootCooldownRemaining = 0f;
             player.PendingShoot = false;
         }
+    }
+
+    private void StartNewMatchClock(DateTimeOffset now)
+    {
+        _matchStartedAtUtc = now;
+        _matchEndsAtUtc = now.Add(MatchDuration);
+        _matchFinished = false;
+        _winnerTeam = null;
+        _loserTeam = null;
+    }
+
+    private void ReassignPlayerTeams()
+    {
+        if (_players.Count == 0)
+        {
+            return;
+        }
+
+        var players = _players.Values
+            .OrderBy(_ => _random.Next())
+            .ToList();
+
+        var firstTeam = _random.Next(2) == 0 ? "blue" : "red";
+        var secondTeam = firstTeam == "blue" ? "red" : "blue";
+
+        for (var i = 0; i < players.Count; i++)
+        {
+            players[i].Team = i % 2 == 0 ? firstTeam : secondTeam;
+        }
+    }
+
+    private void UpdateMatchClock(DateTimeOffset now)
+    {
+        if (_matchFinished || now < _matchEndsAtUtc)
+        {
+            return;
+        }
+
+        FinishMatch();
+    }
+
+    private void FinishMatch()
+    {
+        if (_matchFinished)
+        {
+            return;
+        }
+
+        _matchFinished = true;
+
+        if (_blueScore > _redScore)
+        {
+            _winnerTeam = "blue";
+            _loserTeam = "red";
+        }
+        else if (_redScore > _blueScore)
+        {
+            _winnerTeam = "red";
+            _loserTeam = "blue";
+        }
+        else
+        {
+            _winnerTeam = "draw";
+            _loserTeam = null;
+        }
+
+        foreach (var player in _players.Values)
+        {
+            player.Input = new InputState();
+            player.PendingShoot = false;
+            player.ShootCooldownRemaining = 0f;
+        }
+
+        _logger.LogInformation(
+            "Match finished. Blue {BlueScore} - Red {RedScore}. Winner: {WinnerTeam}",
+            _blueScore,
+            _redScore,
+            _winnerTeam);
+    }
+
+    private long GetMatchRemainingMilliseconds(DateTimeOffset now)
+    {
+        if (_matchFinished)
+        {
+            return 0;
+        }
+
+        var remaining = _matchEndsAtUtc - now;
+        return Math.Max(0, (long)remaining.TotalMilliseconds);
     }
 
     private void ResolvePlayerSeparation()
@@ -686,7 +893,9 @@ public sealed class GameHost
             player.CarryingFlagTeam = null;
         }
 
-        player.Position = FindRespawnPosition(player);
+        var respawn = FindRespawnPosition(player);
+        player.Position = respawn;
+        player.SpawnPosition = respawn;
         player.Facing = player.Team == "blue" ? new Vec2(1f, 0f) : new Vec2(-1f, 0f);
         player.ShootCooldownRemaining = 0.35f;
         player.PendingShoot = false;
@@ -694,27 +903,7 @@ public sealed class GameHost
 
     private Vec2 FindRespawnPosition(PlayerRuntime player)
     {
-        var preferred = player.SpawnPosition;
-        if (!CollidesWithWorld(preferred, player.Radius) && !CollidesWithPlayers(preferred, player.Radius, player.Id))
-        {
-            return preferred;
-        }
-
-        for (var i = 0; i < 24; i++)
-        {
-            var angle = (float)(_random.NextDouble() * Math.PI * 2d);
-            var distance = 18f + (float)_random.NextDouble() * 60f;
-            var candidate = new Vec2(
-                preferred.X + MathF.Cos(angle) * distance,
-                preferred.Y + MathF.Sin(angle) * distance);
-
-            if (!CollidesWithWorld(candidate, player.Radius) && !CollidesWithPlayers(candidate, player.Radius, player.Id))
-            {
-                return candidate;
-            }
-        }
-
-        return preferred;
+        return FindSpawn(player.Team, player.Id, player.Radius);
     }
 
     private void UpdateCarriedFlags()
@@ -890,6 +1079,13 @@ public sealed class GameHost
         var enemyTeam = player.Team == "blue" ? "red" : "blue";
         var enemyFlag = Map.FlagsByTeam[enemyTeam];
 
+        if (ownFlag.CarriedByPlayerId is null
+            && !ownFlag.IsAtBase
+            && Geometry.DistanceSquared(player.Position, ownFlag.Position) <= 26f * 26f)
+        {
+            ownFlag.ResetToBase();
+        }
+
         if (player.CarryingFlagTeam is null)
         {
             if (enemyFlag.CarriedByPlayerId is null && Geometry.DistanceSquared(player.Position, enemyFlag.Position) <= 28f * 28f)
@@ -897,10 +1093,6 @@ public sealed class GameHost
                 player.CarryingFlagTeam = enemyFlag.Team;
                 enemyFlag.CarriedByPlayerId = player.Id;
                 enemyFlag.Position = player.Position;
-            }
-            else if (ownFlag.CarriedByPlayerId is null && !ownFlag.IsAtBase && Geometry.DistanceSquared(player.Position, ownFlag.Position) <= 26f * 26f)
-            {
-                ownFlag.ResetToBase();
             }
         }
         else if (player.CarryingFlagTeam == enemyTeam)
@@ -924,11 +1116,23 @@ public sealed class GameHost
 
     private string BuildStatePayload()
     {
+        var now = DateTimeOffset.UtcNow;
         var dto = new
         {
             type = "state",
-            serverTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            serverTime = now.ToUnixTimeMilliseconds(),
             scores = new { blue = _blueScore, red = _redScore },
+            match = new
+            {
+                status = _matchFinished ? "finished" : "running",
+                durationSeconds = MatchDurationSeconds,
+                startedAt = _matchStartedAtUtc.ToUnixTimeMilliseconds(),
+                endsAt = _matchEndsAtUtc.ToUnixTimeMilliseconds(),
+                remainingMs = GetMatchRemainingMilliseconds(now),
+                winnerTeam = _winnerTeam,
+                loserTeam = _loserTeam,
+                isTie = _winnerTeam == "draw"
+            },
             players = _players.Values.Select(player => new
             {
                 id = player.Id,
@@ -981,7 +1185,7 @@ public sealed class GameHost
         return JsonSerializer.Serialize(dto, _jsonOptions);
     }
 
-    private async Task SendStateToAsync(string playerId, CancellationToken cancellationToken)
+    private void SendStateTo(string playerId)
     {
         ConnectedClient? client;
         string payload;
@@ -991,31 +1195,78 @@ public sealed class GameHost
             payload = BuildStatePayload();
         }
 
-        if (client is not null && client.Socket.State == WebSocketState.Open)
+        if (client is not null && client.Socket.State == WebSocketState.Open && !client.TryQueueRawJson(payload))
         {
-            await SendRawJsonAsync(client.Socket, payload, cancellationToken);
+            _logger.LogWarning("Could not queue initial state for {PlayerId}. Removing client.", playerId);
+            RemoveClient(playerId, abortSocket: true);
         }
     }
 
-    private static Task SendJsonAsync(WebSocket socket, object payload, CancellationToken cancellationToken)
+    private bool TryQueueJson(ConnectedClient client, object payload)
     {
-        var json = JsonSerializer.Serialize(payload);
-        return SendRawJsonAsync(socket, json, cancellationToken);
+        var json = JsonSerializer.Serialize(payload, _jsonOptions);
+        return client.TryQueueRawJson(json);
     }
 
-    private static Task SendRawJsonAsync(WebSocket socket, string payload, CancellationToken cancellationToken)
+    private async Task ClientWriterLoopAsync(ConnectedClient client)
     {
+        try
+        {
+            await foreach (var payload in client.Outbound.Reader.ReadAllAsync(client.SendCancellation.Token))
+            {
+                if (client.Socket.State != WebSocketState.Open)
+                {
+                    break;
+                }
+
+                await SendRawJsonDirectAsync(client.Socket, payload, client.SendCancellation.Token);
+            }
+        }
+        catch (OperationCanceledException ex) when (client.IsStopRequested || _cts.IsCancellationRequested)
+        {
+            _logger.LogInformation(ex, "WebSocket writer stopped for {PlayerId}.", client.PlayerId);
+        }
+        catch (OperationCanceledException ex)
+        {
+            _logger.LogWarning(ex, "WebSocket send timed out for {PlayerId}.", client.PlayerId);
+        }
+        catch (WebSocketException ex)
+        {
+            _logger.LogWarning(ex, "WebSocket writer failed for {PlayerId}.", client.PlayerId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Unexpected WebSocket writer failure for {PlayerId}.", client.PlayerId);
+        }
+        finally
+        {
+            if (!client.IsStopRequested)
+            {
+                RemoveClient(client.PlayerId, abortSocket: true);
+            }
+        }
+    }
+
+    private static async Task SendRawJsonDirectAsync(WebSocket socket, string payload, CancellationToken cancellationToken)
+    {
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutCts.CancelAfter(ClientSendTimeout);
+
         var buffer = Encoding.UTF8.GetBytes(payload);
-        return socket.SendAsync(new ArraySegment<byte>(buffer), WebSocketMessageType.Text, true, cancellationToken);
+        await socket.SendAsync(new ArraySegment<byte>(buffer), WebSocketMessageType.Text, true, timeoutCts.Token);
     }
 
-    private void RemoveClient(string playerId)
+    private void RemoveClient(string playerId, bool abortSocket)
     {
+        ConnectedClient? client = null;
+        PlayerRuntime? removedPlayer = null;
+
         lock (_sync)
         {
-            _clients.Remove(playerId);
+            _clients.Remove(playerId, out client);
             if (_players.Remove(playerId, out var player))
             {
+                removedPlayer = player;
                 if (player.CarryingFlagTeam is not null && Map.FlagsByTeam.TryGetValue(player.CarryingFlagTeam, out var flag))
                 {
                     flag.ResetToBase();
@@ -1023,7 +1274,22 @@ public sealed class GameHost
             }
         }
 
-        _logger.LogInformation("Client removed {PlayerId}", playerId);
+        if (client is not null)
+        {
+            try
+            {
+                client.Stop(abortSocket);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Could not stop WebSocket client resources for {PlayerId}.", playerId);
+            }
+        }
+
+        if (client is not null || removedPlayer is not null)
+        {
+            _logger.LogInformation("Client removed {PlayerId}", playerId);
+        }
     }
 
     private string ChooseTeam()
@@ -1033,7 +1299,178 @@ public sealed class GameHost
         return blue <= red ? "blue" : "red";
     }
 
-    private Vec2 FindSpawn(string team)
+    private Vec2 FindSpawn(string team, string? ignoredPlayerId = null, float radius = PlayerRadius)
+    {
+        if (TryFindPreferredSpawn(team, radius, ignoredPlayerId, out var spawn))
+        {
+            return spawn;
+        }
+
+        _logger.LogWarning("Could not find a clear preferred spawn for team {Team}. Falling back to the team's half of the map.", team);
+        if (TryFindAnyClearSpawnInTeamHalf(team, radius, ignoredPlayerId, out spawn))
+        {
+            return spawn;
+        }
+
+        _logger.LogWarning("Could not find a clear spawn for team {Team}. Falling back to the legacy flag-adjacent spawn.", team);
+        return FindLegacyFlagSpawn(team, radius, ignoredPlayerId);
+    }
+
+    private bool TryFindPreferredSpawn(string team, float radius, string? ignoredPlayerId, out Vec2 spawn)
+    {
+        var anchor = GetTeamSpawnAnchor(team, radius);
+        if (IsClearSpawn(anchor, radius, ignoredPlayerId))
+        {
+            spawn = anchor;
+            return true;
+        }
+
+        var centralHalfWidth = MathF.Min(MathF.Max(Map.Width * 0.24f, radius * 6f), 460f);
+        var verticalHalfHeight = MathF.Min(MathF.Max(Map.Height * 0.15f, radius * 6f), 190f);
+
+        for (var i = 0; i < 160; i++)
+        {
+            var angle = (float)(_random.NextDouble() * Math.PI * 2d);
+            var distance = MathF.Sqrt((float)_random.NextDouble());
+            var candidate = new Vec2(
+                anchor.X + MathF.Cos(angle) * centralHalfWidth * distance,
+                anchor.Y + MathF.Sin(angle) * verticalHalfHeight * distance);
+
+            if (!IsInsidePreferredSpawnZone(candidate, team, radius))
+            {
+                continue;
+            }
+
+            if (IsClearSpawn(candidate, radius, ignoredPlayerId))
+            {
+                spawn = candidate;
+                return true;
+            }
+        }
+
+        return TryFindClearSpawnByGrid(team, radius, ignoredPlayerId, preferredZoneOnly: true, out spawn);
+    }
+
+    private bool TryFindAnyClearSpawnInTeamHalf(string team, float radius, string? ignoredPlayerId, out Vec2 spawn)
+    {
+        return TryFindClearSpawnByGrid(team, radius, ignoredPlayerId, preferredZoneOnly: false, out spawn);
+    }
+
+    private bool TryFindClearSpawnByGrid(string team, float radius, string? ignoredPlayerId, bool preferredZoneOnly, out Vec2 spawn)
+    {
+        var anchor = GetTeamSpawnAnchor(team, radius);
+        var candidates = new List<Vec2>();
+        var step = MathF.Max(radius * 2.4f, 30f);
+        var edgeInset = radius + 18f;
+        var centerX = Map.Width * 0.5f;
+
+        float minX;
+        float maxX;
+        float minY;
+        float maxY;
+
+        if (preferredZoneOnly)
+        {
+            var centralHalfWidth = MathF.Min(MathF.Max(Map.Width * 0.28f, radius * 8f), 520f);
+            minX = MathF.Max(edgeInset, centerX - centralHalfWidth);
+            maxX = MathF.Min(Map.Width - edgeInset, centerX + centralHalfWidth);
+
+            if (team == "red")
+            {
+                minY = edgeInset;
+                maxY = MathF.Min(Map.Height - edgeInset, MathF.Max(edgeInset, Map.Height * 0.38f));
+            }
+            else
+            {
+                minY = MathF.Max(edgeInset, MathF.Min(Map.Height - edgeInset, Map.Height * 0.62f));
+                maxY = Map.Height - edgeInset;
+            }
+        }
+        else
+        {
+            minX = edgeInset;
+            maxX = Map.Width - edgeInset;
+
+            if (team == "red")
+            {
+                minY = edgeInset;
+                maxY = MathF.Min(Map.Height - edgeInset, Map.Height * 0.5f);
+            }
+            else
+            {
+                minY = MathF.Max(edgeInset, Map.Height * 0.5f);
+                maxY = Map.Height - edgeInset;
+            }
+        }
+
+        if (maxX < minX || maxY < minY)
+        {
+            spawn = default;
+            return false;
+        }
+
+        for (var y = minY; y <= maxY; y += step)
+        {
+            for (var x = minX; x <= maxX; x += step)
+            {
+                candidates.Add(new Vec2(x, y));
+            }
+        }
+
+        candidates.Sort((a, b) => Geometry.DistanceSquared(a, anchor).CompareTo(Geometry.DistanceSquared(b, anchor)));
+
+        foreach (var candidate in candidates)
+        {
+            if (preferredZoneOnly && !IsInsidePreferredSpawnZone(candidate, team, radius))
+            {
+                continue;
+            }
+
+            if (IsClearSpawn(candidate, radius, ignoredPlayerId))
+            {
+                spawn = candidate;
+                return true;
+            }
+        }
+
+        spawn = default;
+        return false;
+    }
+
+    private Vec2 GetTeamSpawnAnchor(string team, float radius)
+    {
+        var edgeInset = radius + 28f;
+        var x = Math.Clamp(Map.Width * 0.5f, edgeInset, MathF.Max(edgeInset, Map.Width - edgeInset));
+        var topY = Math.Clamp(Map.Height * 0.14f, edgeInset, MathF.Max(edgeInset, Map.Height - edgeInset));
+        var bottomY = Math.Clamp(Map.Height * 0.86f, edgeInset, MathF.Max(edgeInset, Map.Height - edgeInset));
+        return team == "red" ? new Vec2(x, topY) : new Vec2(x, bottomY);
+    }
+
+    private bool IsInsidePreferredSpawnZone(Vec2 candidate, string team, float radius)
+    {
+        var edgeInset = radius + 18f;
+        var centerX = Map.Width * 0.5f;
+        var centralHalfWidth = MathF.Min(MathF.Max(Map.Width * 0.30f, radius * 8f), 560f);
+
+        if (candidate.X < centerX - centralHalfWidth || candidate.X > centerX + centralHalfWidth)
+        {
+            return false;
+        }
+
+        if (team == "red")
+        {
+            return candidate.Y >= edgeInset && candidate.Y <= MathF.Max(edgeInset, Map.Height * 0.40f);
+        }
+
+        return candidate.Y >= MathF.Min(Map.Height - edgeInset, Map.Height * 0.60f) && candidate.Y <= Map.Height - edgeInset;
+    }
+
+    private bool IsClearSpawn(Vec2 spawn, float radius, string? ignoredPlayerId)
+    {
+        return !CollidesWithWorld(spawn, radius) && !CollidesWithPlayers(spawn, radius, ignoredPlayerId);
+    }
+
+    private Vec2 FindLegacyFlagSpawn(string team, float radius, string? ignoredPlayerId)
     {
         var ownFlag = Map.FlagsByTeam[team];
 
@@ -1045,13 +1482,14 @@ public sealed class GameHost
                 ownFlag.BasePosition.X + MathF.Cos(angle) * distance,
                 ownFlag.BasePosition.Y + MathF.Sin(angle) * distance);
 
-            if (!CollidesWithWorld(spawn, PlayerRadius) && !CollidesWithPlayers(spawn, PlayerRadius))
+            if (IsClearSpawn(spawn, radius, ignoredPlayerId))
             {
                 return spawn;
             }
         }
 
-        return ownFlag.BasePosition + (team == "blue" ? new Vec2(50f, 0f) : new Vec2(-50f, 0f));
+        var fallback = ownFlag.BasePosition + (team == "blue" ? new Vec2(50f, 0f) : new Vec2(-50f, 0f));
+        return fallback;
     }
 
     private static GameMap LoadMapFromFile(string mapPath)
