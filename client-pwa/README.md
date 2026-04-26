@@ -15,7 +15,7 @@ The app currently includes:
 - backend connection through WebSocket
 - map loading through `GET /api/map`
 - arena rendering in Canvas 2D
-- rendering for players, flags, shot traces, and hit effects
+- rendering for detailed 0.50x top-down player avatars, flags, shot traces, and hit effects
 - side drawer with match information
 - desktop and mobile controls
 - live ping measurement
@@ -75,8 +75,10 @@ When the player clicks **Connect**:
 - centered match timer between score bubbles
 - compact translucent top-edge score/timer HUD to reduce obstruction on mobile
 - player names
+- carried-flag rendering attached to the player avatar when flag-carrier data is present or inferable
 - shot cooldown display support
-- real-time match state updates
+- real-time match state updates with visual interpolation for smoother player movement
+- doubled player footstep animation cadence without changing gameplay displacement speed
 - final-result overlay when the server marks the match as finished
 - **Reset Match** sends `resetGame`, which resets scores, flags, timer, teams, and positions on the backend
 - local player team/accent updates when the backend reassigns teams after reset
@@ -344,3 +346,11 @@ Spawn zones are not drawn from map JSON. They are computed by the backend and re
 
 **David Jorge Aguirre Grazio**  
 Developer
+
+## Iteración visual: retícula táctica
+
+- Se reemplazó la retícula simple anterior por una retícula cenital táctica basada en el asset adjunto.
+- El nuevo fondo incluye gradiente, capas de cuadrícula fina/media/mayor/sectorial, textura diagonal, puntos de intersección, etiquetas de sector y viñeta.
+- Se mantiene todo el gameplay, la velocidad de desplazamiento y la animación del avatar de la iteración anterior.
+- Service worker actualizado a `the-flag-shell-v8` para forzar actualización del shell PWA.
+

@@ -180,6 +180,228 @@ const TEAM_COLORS = {
   red: '#ff6565',
 };
 
+const PLAYER_AVATAR_SIZE = 0.50;
+const PLAYER_AVATAR_VISUAL_RADIUS = 42 * PLAYER_AVATAR_SIZE;
+const PLAYER_AVATAR_MOTION_TTL_MS = 170;
+const PLAYER_AVATAR_MOVE_EPSILON_PX = 0.12;
+const PLAYER_AVATAR_WALK_PHASE_SPEED = 28;
+const PLAYER_AVATAR_IDLE_PHASE_SPEED = 4;
+const PLAYER_POSITION_SMOOTHING_MS = 82;
+const PLAYER_POSITION_SELF_PREDICTION_MS = 52;
+const PLAYER_POSITION_REMOTE_PREDICTION_MS = 24;
+const PLAYER_POSITION_MAX_PREDICTION_PX = 14;
+const PLAYER_POSITION_SNAP_DISTANCE_PX = 160;
+const PLAYER_POSITION_CHANGE_EPSILON_PX = 0.01;
+const playerAvatarStates = new Map();
+const playerRenderStates = new Map();
+
+const TOP_DOWN_AVATAR_PALETTES = {
+  blue: {
+    suit: '#2f80ed',
+    suitDark: '#1e4f9c',
+    accent: '#8cc6ff',
+    cap: '#2563eb',
+    flag: '#38bdf8',
+  },
+  red: {
+    suit: '#b94a48',
+    suitDark: '#7f1d1d',
+    accent: '#d98b84',
+    cap: '#a63f3c',
+    flag: '#e98787',
+  },
+  neutral: {
+    suit: '#94a3b8',
+    suitDark: '#475569',
+    accent: '#e2e8f0',
+    cap: '#64748b',
+    flag: '#f8fafc',
+  },
+};
+
+class TopDownAvatar {
+  constructor({ team = 'neutral', size = PLAYER_AVATAR_SIZE } = {}) {
+    this.x = 0;
+    this.y = 0;
+    this.angle = 0;
+    this.walkPhase = 0;
+    this.hasFlag = false;
+    this.flagTeam = null;
+    this.setSize(size);
+    this.setTeam(team);
+  }
+
+  setTeam(team) {
+    const normalizedTeam = normalizeTeamValue(team) || 'neutral';
+    this.team = normalizedTeam;
+    this.colors = TOP_DOWN_AVATAR_PALETTES[normalizedTeam] || TOP_DOWN_AVATAR_PALETTES.neutral;
+  }
+
+  setSize(size = PLAYER_AVATAR_SIZE) {
+    const numericSize = Number(size);
+    this.size = Number.isFinite(numericSize)
+      ? Math.min(2, Math.max(0.45, numericSize))
+      : PLAYER_AVATAR_SIZE;
+  }
+
+  draw(ctx, {
+    x = 0,
+    y = 0,
+    angle = 0,
+    walkPhase = 0,
+    team = 'neutral',
+    size = PLAYER_AVATAR_SIZE,
+    hasFlag = false,
+    flagTeam = null,
+  } = {}) {
+    this.x = x;
+    this.y = y;
+    this.angle = Number.isFinite(angle) ? angle : 0;
+    this.walkPhase = Number.isFinite(walkPhase) ? walkPhase : 0;
+    this.hasFlag = Boolean(hasFlag);
+    this.flagTeam = normalizeTeamValue(flagTeam);
+    this.setSize(size);
+    this.setTeam(team);
+
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    ctx.rotate(this.angle);
+    ctx.scale(this.size, this.size);
+
+    this._drawSoftShadow(ctx);
+
+    if (this.hasFlag) {
+      this._drawCarriedFlag(ctx);
+    }
+
+    this._drawFeet(ctx);
+    this._drawShoulders(ctx);
+    this._drawTorso(ctx);
+    this._drawHeadAndCap(ctx);
+
+    ctx.restore();
+  }
+
+  _drawSoftShadow(ctx) {
+    const gradient = ctx.createRadialGradient(0, 0, 8, 0, 0, 38);
+    gradient.addColorStop(0, 'rgba(0,0,0,0.32)');
+    gradient.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = gradient;
+    ctx.beginPath();
+    ctx.ellipse(0, 2, 42, 28, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  _drawFeet(ctx) {
+    const step = Math.sin(this.walkPhase) * 4.5;
+    const footY = 11;
+
+    ctx.fillStyle = this.colors.suitDark;
+    ctx.strokeStyle = 'rgba(255,255,255,0.16)';
+    ctx.lineWidth = 1.5;
+
+    this._roundedEllipse(ctx, -19 + step, -footY, 10, 6, -0.2);
+    ctx.fill();
+    ctx.stroke();
+
+    this._roundedEllipse(ctx, -19 - step, footY, 10, 6, 0.2);
+    ctx.fill();
+    ctx.stroke();
+  }
+
+  _drawShoulders(ctx) {
+    ctx.fillStyle = this.colors.suit;
+    ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+    ctx.lineWidth = 2;
+
+    this._roundedEllipse(ctx, -2, -19, 14, 8, -0.28);
+    ctx.fill();
+    ctx.stroke();
+
+    this._roundedEllipse(ctx, -2, 19, 14, 8, 0.28);
+    ctx.fill();
+    ctx.stroke();
+  }
+
+  _drawTorso(ctx) {
+    const bodyGradient = ctx.createLinearGradient(-25, 0, 24, 0);
+    bodyGradient.addColorStop(0, this.colors.suitDark);
+    bodyGradient.addColorStop(0.55, this.colors.suit);
+    bodyGradient.addColorStop(1, this.colors.accent);
+
+    ctx.fillStyle = bodyGradient;
+    ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+    ctx.lineWidth = 2.2;
+
+    ctx.beginPath();
+    ctx.ellipse(-2, 0, 26, 20, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = 'rgba(255,255,255,0.14)';
+    ctx.beginPath();
+    ctx.ellipse(11, -6, 8, 5, -0.4, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  _drawHeadAndCap(ctx) {
+    ctx.strokeStyle = 'rgba(255,255,255,0.24)';
+    ctx.lineWidth = 2;
+
+    ctx.beginPath();
+    ctx.arc(18, 0, 14, 0, Math.PI * 2);
+    ctx.fillStyle = this.colors.cap;
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = 'rgba(255,255,255,0.18)';
+    ctx.beginPath();
+    ctx.arc(13, -4, 4.2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  _drawCarriedFlag(ctx) {
+    const flagColor = TOP_DOWN_AVATAR_PALETTES[this.flagTeam]?.flag || this.colors.flag;
+
+    ctx.save();
+    ctx.translate(3, -19);
+    ctx.rotate(-0.08);
+
+    ctx.strokeStyle = 'rgba(226,232,240,0.92)';
+    ctx.lineWidth = 2.5;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(0, 10);
+    ctx.lineTo(0, -28);
+    ctx.stroke();
+
+    ctx.fillStyle = 'rgba(15,23,42,0.38)';
+    ctx.beginPath();
+    ctx.arc(0, 6, 4.2, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = flagColor;
+    ctx.strokeStyle = 'rgba(15,23,42,0.45)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(0, -28);
+    ctx.lineTo(28, -19);
+    ctx.lineTo(0, -10);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.restore();
+  }
+
+  _roundedEllipse(ctx, x, y, rx, ry, rotation) {
+    ctx.beginPath();
+    ctx.ellipse(x, y, rx, ry, rotation, 0, Math.PI * 2);
+  }
+}
+
+const playerAvatarRenderer = new TopDownAvatar({ size: PLAYER_AVATAR_SIZE });
+
 function setCanvasAccent(team) {
   const normalized = team === 'blue' || team === 'red' ? team : null;
   const border = normalized ? toRgba(TEAM_COLORS[normalized], 0.9) : 'rgba(194, 205, 246, 0.22)';
@@ -274,7 +496,8 @@ function computeTargetCamera() {
   const aspectRatio = Math.max(0.24, Math.min(1, getViewportAspectRatio()));
   const viewHeight = world.height;
   const viewWidth = Math.min(world.width, Math.max(320, viewHeight * aspectRatio));
-  const player = state.players.find((item) => item.id === state.myPlayerId);
+  const rawPlayer = state.players.find((item) => item.id === state.myPlayerId);
+  const player = rawPlayer ? getPlayerRenderProxy(rawPlayer) : null;
   const facingX = player && Number.isFinite(player.facingX) ? player.facingX : 0;
   const lookAhead = viewWidth * 0.14;
   const anchorX = player ? player.x + facingX * lookAhead : world.width / 2;
@@ -801,6 +1024,7 @@ function connect() {
     state.effects = [];
     state.seenEventIds.clear();
     state.recentPlayerImpacts = [];
+    playerRenderStates.clear();
     state.lastFrameTime = null;
     state.match.status = 'running';
     state.match.remainingMs = Math.max(0, (state.match.durationSeconds || 300) * 1000);
@@ -1154,6 +1378,7 @@ function renderLoop(frameTime) {
   const dtMs = Math.min(64, Math.max(0, frameTime - state.lastFrameTime));
   state.lastFrameTime = frameTime;
   updateEffects(dtMs);
+  updatePlayerRenderStates(dtMs, frameTime);
   updateCamera(dtMs);
   draw();
   requestAnimationFrame(renderLoop);
@@ -1183,24 +1408,132 @@ function draw() {
 
 function drawBackgroundGrid() {
   const world = getWorldSize();
-  ctx.fillStyle = '#0b1123';
-  ctx.fillRect(0, 0, world.width, world.height);
+  const width = Math.max(1, world.width);
+  const height = Math.max(1, world.height);
 
-  ctx.strokeStyle = 'rgba(120,140,255,0.05)';
+  drawTacticalGridBase(width, height);
+  drawTacticalGridLayer(width, height, 24, 'rgba(148,163,184,0.045)', 1);
+  drawTacticalGridLayer(width, height, 48, 'rgba(148,163,184,0.092)', 1);
+  drawTacticalGridLayer(width, height, 96, 'rgba(226,232,240,0.135)', 1.25);
+  drawTacticalGridLayer(width, height, 192, 'rgba(104,225,253,0.13)', 1.6);
+  drawTacticalGridDiagonalTexture(width, height, 96);
+  drawTacticalGridIntersectionDots(width, height, 96);
+  drawTacticalGridSectorLabels(width, height, 192);
+  drawTacticalGridVignette(width, height);
+}
+
+function drawTacticalGridBase(width, height) {
+  const baseGradient = ctx.createLinearGradient(0, 0, width, height);
+  baseGradient.addColorStop(0, '#091322');
+  baseGradient.addColorStop(0.48, '#0b1826');
+  baseGradient.addColorStop(1, '#082b2e');
+
+  ctx.fillStyle = baseGradient;
+  ctx.fillRect(0, 0, width, height);
+}
+
+function drawTacticalGridLayer(width, height, spacing, color, lineWidth) {
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lineWidth;
+
+  for (let x = 0; x <= width; x += spacing) {
+    ctx.beginPath();
+    ctx.moveTo(x + 0.5, 0);
+    ctx.lineTo(x + 0.5, height);
+    ctx.stroke();
+  }
+
+  for (let y = 0; y <= height; y += spacing) {
+    ctx.beginPath();
+    ctx.moveTo(0, y + 0.5);
+    ctx.lineTo(width, y + 0.5);
+    ctx.stroke();
+  }
+
+  ctx.restore();
+}
+
+function drawTacticalGridDiagonalTexture(width, height, spacing) {
+  ctx.save();
+  ctx.strokeStyle = 'rgba(148,163,184,0.035)';
   ctx.lineWidth = 1;
-  const step = 40;
-  for (let x = 0; x <= world.width; x += step) {
+
+  for (let x = -height; x < width; x += spacing) {
     ctx.beginPath();
     ctx.moveTo(x, 0);
-    ctx.lineTo(x, world.height);
+    ctx.lineTo(x + height, height);
     ctx.stroke();
   }
-  for (let y = 0; y <= world.height; y += step) {
-    ctx.beginPath();
-    ctx.moveTo(0, y);
-    ctx.lineTo(world.width, y);
-    ctx.stroke();
+
+  ctx.restore();
+}
+
+function drawTacticalGridIntersectionDots(width, height, spacing) {
+  ctx.save();
+  ctx.fillStyle = 'rgba(226,232,240,0.16)';
+
+  for (let x = spacing; x < width; x += spacing) {
+    for (let y = spacing; y < height; y += spacing) {
+      ctx.beginPath();
+      ctx.arc(x, y, 1.6, 0, Math.PI * 2);
+      ctx.fill();
+    }
   }
+
+  ctx.restore();
+}
+
+function drawTacticalGridSectorLabels(width, height, spacing) {
+  const columns = Math.ceil(width / spacing);
+  const rows = Math.ceil(height / spacing);
+
+  ctx.save();
+  ctx.fillStyle = 'rgba(203,213,225,0.22)';
+  ctx.font = '700 10px Inter, Segoe UI, system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  for (let column = 0; column < columns; column += 1) {
+    for (let row = 0; row < rows; row += 1) {
+      const label = `${getTacticalGridColumnLabel(column)}${row + 1}`;
+      ctx.fillText(label, column * spacing + 18, row * spacing + 18);
+    }
+  }
+
+  ctx.restore();
+}
+
+function getTacticalGridColumnLabel(index) {
+  let label = '';
+  let value = Math.max(0, Math.floor(index));
+
+  do {
+    label = String.fromCharCode(65 + (value % 26)) + label;
+    value = Math.floor(value / 26) - 1;
+  } while (value >= 0);
+
+  return label;
+}
+
+function drawTacticalGridVignette(width, height) {
+  const radius = Math.max(width, height);
+  const vignette = ctx.createRadialGradient(
+    width / 2,
+    height / 2,
+    radius * 0.18,
+    width / 2,
+    height / 2,
+    radius * 0.68
+  );
+
+  vignette.addColorStop(0, 'rgba(0,0,0,0)');
+  vignette.addColorStop(1, 'rgba(0,0,0,0.28)');
+
+  ctx.save();
+  ctx.fillStyle = vignette;
+  ctx.fillRect(0, 0, width, height);
+  ctx.restore();
 }
 
 function drawMap() {
@@ -1266,6 +1599,10 @@ function drawFlags() {
     const baseY = runtime ? runtime.baseY : obj.y;
     const color = TEAM_COLORS[obj.team] || '#ffffff';
 
+    if (runtime && getFlagCarrierPlayer(runtime)) {
+      continue;
+    }
+
     ctx.save();
     ctx.strokeStyle = 'rgba(255,255,255,0.25)';
     ctx.setLineDash([6, 6]);
@@ -1299,6 +1636,7 @@ function drawFlags() {
     ctx.restore();
   }
 }
+
 
 function processServerEvents(events) {
   const now = performance.now();
@@ -1681,6 +2019,334 @@ function hashString(value) {
   return Math.abs(hash);
 }
 
+function normalizeTeamValue(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return normalized === 'blue' || normalized === 'red' ? normalized : null;
+}
+
+function getOpposingTeam(team) {
+  const normalizedTeam = normalizeTeamValue(team);
+  if (normalizedTeam === 'blue') return 'red';
+  if (normalizedTeam === 'red') return 'blue';
+  return null;
+}
+
+function getPlayerAvatarStateKey(player) {
+  if (player && player.id !== undefined && player.id !== null) {
+    return String(player.id);
+  }
+  return `${player?.team || 'neutral'}:${player?.name || 'player'}`;
+}
+
+function getNumericPlayerPosition(player) {
+  return {
+    x: Number.isFinite(Number(player?.x)) ? Number(player.x) : 0,
+    y: Number.isFinite(Number(player?.y)) ? Number(player.y) : 0,
+  };
+}
+
+function getMovementInputVector() {
+  const x = (state.input.right ? 1 : 0) - (state.input.left ? 1 : 0);
+  const y = (state.input.down ? 1 : 0) - (state.input.up ? 1 : 0);
+  const length = Math.hypot(x, y);
+
+  if (length <= 0) {
+    return { x: 0, y: 0 };
+  }
+
+  return { x: x / length, y: y / length };
+}
+
+function limitVectorLength(x, y, maxLength) {
+  const length = Math.hypot(x, y);
+
+  if (!Number.isFinite(length) || length <= maxLength || maxLength <= 0) {
+    return { x, y };
+  }
+
+  const scale = maxLength / length;
+  return { x: x * scale, y: y * scale };
+}
+
+function getPlayerRenderState(player) {
+  return playerRenderStates.get(getPlayerAvatarStateKey(player));
+}
+
+function getPlayerRenderPosition(player) {
+  const renderState = getPlayerRenderState(player);
+
+  if (renderState) {
+    return { x: renderState.x, y: renderState.y };
+  }
+
+  return getNumericPlayerPosition(player);
+}
+
+function getPlayerRenderProxy(player) {
+  const position = getPlayerRenderPosition(player);
+  return {
+    ...player,
+    x: position.x,
+    y: position.y,
+  };
+}
+
+function updatePlayerRenderStates(dtMs, now = performance.now()) {
+  const activeKeys = new Set();
+  const dt = Math.min(64, Math.max(0, Number(dtMs) || 0));
+  const blend = 1 - Math.exp(-dt / PLAYER_POSITION_SMOOTHING_MS);
+  const selfInputVector = getMovementInputVector();
+  const selfInputActive = Math.hypot(selfInputVector.x, selfInputVector.y) > 0;
+
+  for (const player of state.players) {
+    const key = getPlayerAvatarStateKey(player);
+    const isSelf = player.id === state.myPlayerId;
+    const target = getNumericPlayerPosition(player);
+    let renderState = playerRenderStates.get(key);
+
+    activeKeys.add(key);
+
+    if (!renderState) {
+      renderState = {
+        x: target.x,
+        y: target.y,
+        targetX: target.x,
+        targetY: target.y,
+        velocityX: 0,
+        velocityY: 0,
+        lastTargetAt: now,
+        lastFrameAt: now,
+      };
+      playerRenderStates.set(key, renderState);
+      continue;
+    }
+
+    const targetDelta = Math.hypot(target.x - renderState.targetX, target.y - renderState.targetY);
+
+    if (targetDelta > PLAYER_POSITION_CHANGE_EPSILON_PX) {
+      const elapsedSinceTargetSeconds = Math.max(0.016, (now - renderState.lastTargetAt) / 1000);
+      renderState.velocityX = (target.x - renderState.targetX) / elapsedSinceTargetSeconds;
+      renderState.velocityY = (target.y - renderState.targetY) / elapsedSinceTargetSeconds;
+      renderState.targetX = target.x;
+      renderState.targetY = target.y;
+      renderState.lastTargetAt = now;
+    } else if (now - renderState.lastTargetAt > 180) {
+      renderState.velocityX *= 0.86;
+      renderState.velocityY *= 0.86;
+    }
+
+    let desiredX = renderState.targetX;
+    let desiredY = renderState.targetY;
+    const targetAgeMs = Math.max(0, now - renderState.lastTargetAt);
+    const predictionMs = isSelf
+      ? Math.min(PLAYER_POSITION_SELF_PREDICTION_MS, targetAgeMs + dt)
+      : Math.min(PLAYER_POSITION_REMOTE_PREDICTION_MS, targetAgeMs);
+
+    if (predictionMs > 0) {
+      let predictionX = renderState.velocityX * (predictionMs / 1000);
+      let predictionY = renderState.velocityY * (predictionMs / 1000);
+      const limitedPrediction = limitVectorLength(predictionX, predictionY, PLAYER_POSITION_MAX_PREDICTION_PX);
+      predictionX = limitedPrediction.x;
+      predictionY = limitedPrediction.y;
+
+      if (isSelf && selfInputActive) {
+        const predictedLength = Math.hypot(predictionX, predictionY);
+        if (predictedLength > 0) {
+          predictionX = selfInputVector.x * predictedLength;
+          predictionY = selfInputVector.y * predictedLength;
+        }
+      }
+
+      desiredX += predictionX;
+      desiredY += predictionY;
+    }
+
+    const distanceToServer = Math.hypot(renderState.x - target.x, renderState.y - target.y);
+    const distanceToDesired = Math.hypot(renderState.x - desiredX, renderState.y - desiredY);
+
+    if (distanceToServer > PLAYER_POSITION_SNAP_DISTANCE_PX || distanceToDesired > PLAYER_POSITION_SNAP_DISTANCE_PX) {
+      renderState.x = target.x;
+      renderState.y = target.y;
+    } else {
+      renderState.x += (desiredX - renderState.x) * blend;
+      renderState.y += (desiredY - renderState.y) * blend;
+
+      if (Math.hypot(renderState.x - desiredX, renderState.y - desiredY) < 0.02) {
+        renderState.x = desiredX;
+        renderState.y = desiredY;
+      }
+    }
+
+    renderState.lastFrameAt = now;
+  }
+
+  for (const key of playerRenderStates.keys()) {
+    if (!activeKeys.has(key)) {
+      playerRenderStates.delete(key);
+    }
+  }
+}
+
+function getPlayerAvatarMotion(player, isSelf, now) {
+  const key = getPlayerAvatarStateKey(player);
+  const x = Number(player.x) || 0;
+  const y = Number(player.y) || 0;
+  const existing = playerAvatarStates.get(key) || {
+    x,
+    y,
+    walkPhase: hashString(key) % 360,
+    lastUpdateAt: now,
+    lastMovementAt: 0,
+  };
+
+  const movedDistance = Math.hypot(x - existing.x, y - existing.y);
+  const selfInputMoving = Boolean(isSelf && (state.input.up || state.input.down || state.input.left || state.input.right));
+
+  if (movedDistance > PLAYER_AVATAR_MOVE_EPSILON_PX || selfInputMoving) {
+    existing.lastMovementAt = now;
+  }
+
+  const dt = Math.min(0.064, Math.max(0, (now - existing.lastUpdateAt) / 1000));
+  const movingRecently = now - existing.lastMovementAt <= PLAYER_AVATAR_MOTION_TTL_MS;
+  existing.walkPhase += dt * (movingRecently ? PLAYER_AVATAR_WALK_PHASE_SPEED : PLAYER_AVATAR_IDLE_PHASE_SPEED);
+  existing.x = x;
+  existing.y = y;
+  existing.lastUpdateAt = now;
+  playerAvatarStates.set(key, existing);
+
+  const facing = getFacingVector(player);
+  return {
+    angle: facing.angle,
+    walkPhase: existing.walkPhase,
+  };
+}
+
+function getFlagCarrierId(flag) {
+  const directCandidates = [
+    flag?.carrierId,
+    flag?.carriedBy,
+    flag?.carriedById,
+    flag?.holderId,
+    flag?.playerId,
+  ];
+
+  for (const candidate of directCandidates) {
+    if (candidate !== undefined && candidate !== null && String(candidate).trim()) {
+      return String(candidate);
+    }
+  }
+
+  const nestedCandidates = [flag?.carrier?.id, flag?.holder?.id, flag?.player?.id];
+  for (const candidate of nestedCandidates) {
+    if (candidate !== undefined && candidate !== null && String(candidate).trim()) {
+      return String(candidate);
+    }
+  }
+
+  return null;
+}
+
+function isFlagAtBase(flag) {
+  const x = Number(flag?.x);
+  const y = Number(flag?.y);
+  const baseX = Number(flag?.baseX);
+  const baseY = Number(flag?.baseY);
+
+  if (![x, y, baseX, baseY].every(Number.isFinite)) {
+    return false;
+  }
+
+  return Math.hypot(x - baseX, y - baseY) <= 3;
+}
+
+function getFlagCarrierPlayer(flag) {
+  const flagTeam = normalizeTeamValue(flag?.team);
+  const explicitCarrierId = getFlagCarrierId(flag);
+
+  if (explicitCarrierId) {
+    return state.players.find((player) => String(player.id) === explicitCarrierId) || null;
+  }
+
+  const status = String(flag?.status || flag?.state || '').toLowerCase();
+  if (status === 'home' || status === 'base' || status === 'dropped' || isFlagAtBase(flag)) {
+    return null;
+  }
+
+  const flagX = Number(flag?.x);
+  const flagY = Number(flag?.y);
+  if (!Number.isFinite(flagX) || !Number.isFinite(flagY)) {
+    return null;
+  }
+
+  let nearest = null;
+  let nearestDistance = Infinity;
+  for (const player of state.players) {
+    const playerTeam = normalizeTeamValue(player.team);
+    if (flagTeam && playerTeam && flagTeam === playerTeam) {
+      continue;
+    }
+
+    const distance = Math.hypot(flagX - player.x, flagY - player.y);
+    const maxDistance = Math.max(Number(player.radius) || 14, PLAYER_AVATAR_VISUAL_RADIUS) + 8;
+    if (distance <= maxDistance && distance < nearestDistance) {
+      nearest = player;
+      nearestDistance = distance;
+    }
+  }
+
+  return nearest;
+}
+
+function getPlayerCarriedFlagTeam(player) {
+  const directTeamCandidates = [
+    player?.carryingFlagTeam,
+    player?.carriedFlagTeam,
+    player?.flagTeam,
+    player?.capturedFlagTeam,
+    player?.hasFlagTeam,
+  ];
+
+  for (const candidate of directTeamCandidates) {
+    const team = normalizeTeamValue(candidate);
+    if (team) {
+      return team;
+    }
+  }
+
+  const nestedTeamCandidates = [
+    player?.flag?.team,
+    player?.carryingFlag?.team,
+    player?.carriedFlag?.team,
+  ];
+
+  for (const candidate of nestedTeamCandidates) {
+    const team = normalizeTeamValue(candidate);
+    if (team) {
+      return team;
+    }
+  }
+
+  if (player?.hasFlag === true || player?.carryingFlag === true || player?.carriesFlag === true) {
+    return getOpposingTeam(player.team);
+  }
+
+  for (const flag of state.flags) {
+    const carrier = getFlagCarrierPlayer(flag);
+    if (carrier === player || (carrier && carrier.id !== undefined && player.id !== undefined && String(carrier.id) === String(player.id))) {
+      return normalizeTeamValue(flag.team) || getOpposingTeam(player.team);
+    }
+  }
+
+  return null;
+}
+
+function getPlayerAvatarLabelY(player, carriedFlagTeam) {
+  const radius = Number(player.radius) || 14;
+  const visualRadius = Math.max(radius, PLAYER_AVATAR_VISUAL_RADIUS);
+  const flagClearance = carriedFlagTeam ? 8 : 0;
+  return player.y - visualRadius - 12 - flagClearance;
+}
+
 function getFacingVector(player) {
   const rawX = Number.isFinite(player.facingX) ? player.facingX : 1;
   const rawY = Number.isFinite(player.facingY) ? player.facingY : 0;
@@ -1801,88 +2467,75 @@ function drawFlagCarrierBadgeAt(x, y, flagTeam, scale = 1) {
   ctx.restore();
 }
 
-function drawPlayerAvatar(player, isSelf) {
+function drawPlayerAvatar(player, isSelf, now = performance.now(), carriedFlagTeam = getPlayerCarriedFlagTeam(player)) {
   const teamColor = TEAM_COLORS[player.team] || '#ffffff';
   const radius = Number(player.radius) || 14;
-  const facing = getFacingVector(player);
-  const darkFill = mixHexColors(teamColor, '#10131a', 0.35);
-  const coreFill = mixHexColors(teamColor, '#10131a', 0.2);
-  const accentFill = mixHexColors(teamColor, '#ffffff', 0.34);
-  const markColor = toRgba('#ffffff', 0.8);
-  const markDetailColor = toRgba('#10131a', 0.45);
+  const motion = getPlayerAvatarMotion(player, isSelf, now);
 
   ctx.save();
 
   if (isSelf) {
-    const pulse = 0.75 + (Math.sin(performance.now() / 220) + 1) * 0.12;
+    const pulse = 0.75 + (Math.sin(now / 220) + 1) * 0.12;
     ctx.fillStyle = toRgba(teamColor, 0.18);
     ctx.beginPath();
-    ctx.arc(player.x, player.y, radius * pulse + 5, 0, Math.PI * 2);
+    ctx.arc(player.x, player.y, Math.max(radius * pulse + 5, PLAYER_AVATAR_VISUAL_RADIUS * 0.92), 0, Math.PI * 2);
     ctx.fill();
   }
 
-  ctx.fillStyle = 'rgba(0, 0, 0, 0.22)';
-  ctx.beginPath();
-  ctx.ellipse(player.x, player.y + radius * 0.36, radius * 0.88, radius * 0.48, 0, 0, Math.PI * 2);
-  ctx.fill();
+  playerAvatarRenderer.draw(ctx, {
+    x: player.x,
+    y: player.y,
+    angle: motion.angle,
+    walkPhase: motion.walkPhase,
+    team: player.team,
+    size: PLAYER_AVATAR_SIZE,
+    hasFlag: Boolean(carriedFlagTeam),
+    flagTeam: carriedFlagTeam,
+  });
 
-  ctx.fillStyle = teamColor;
-  ctx.beginPath();
-  ctx.arc(player.x, player.y, radius, 0, Math.PI * 2);
-  ctx.fill();
-
-  ctx.fillStyle = coreFill;
-  ctx.beginPath();
-  ctx.arc(player.x, player.y, radius * 0.74, 0, Math.PI * 2);
-  ctx.fill();
-
-  ctx.fillStyle = toRgba('#ffffff', 0.18);
-  ctx.beginPath();
-  ctx.arc(player.x - radius * 0.28, player.y - radius * 0.3, radius * 0.24, 0, Math.PI * 2);
-  ctx.fill();
-
-  drawPlayerMark(player, radius * 0.74, markColor, markDetailColor);
-
-  ctx.save();
-  ctx.translate(player.x, player.y);
-  ctx.rotate(facing.angle);
-  ctx.fillStyle = accentFill;
-  roundRect(ctx, radius * 0.15, -radius * 0.26, radius * 0.74, radius * 0.52, radius * 0.24);
-  ctx.fill();
-  ctx.strokeStyle = toRgba('#10131a', 0.45);
-  ctx.lineWidth = Math.max(1.5, radius * 0.1);
-  ctx.stroke();
-  ctx.restore();
-
-  ctx.strokeStyle = isSelf ? '#ffffff' : darkFill;
-  ctx.lineWidth = isSelf ? 3 : 2;
-  ctx.beginPath();
-  ctx.arc(player.x, player.y, radius, 0, Math.PI * 2);
-  ctx.stroke();
+  if (isSelf) {
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(player.x, player.y, Math.max(radius + 4, PLAYER_AVATAR_VISUAL_RADIUS * 0.92), 0, Math.PI * 2);
+    ctx.stroke();
+  }
 
   ctx.restore();
 }
 
 function drawPlayers() {
+  const now = performance.now();
+  const activeAvatarStateKeys = new Set();
+
   for (const player of state.players) {
     const isSelf = player.id === state.myPlayerId;
-    const radius = Number(player.radius) || 14;
+    const avatarStateKey = getPlayerAvatarStateKey(player);
+    const carriedFlagTeam = getPlayerCarriedFlagTeam(player);
+    const renderPlayer = getPlayerRenderProxy(player);
+    activeAvatarStateKeys.add(avatarStateKey);
 
-    drawPlayerAvatar(player, isSelf);
+    drawPlayerAvatar(renderPlayer, isSelf, now, carriedFlagTeam);
 
     ctx.save();
     ctx.font = '16px Segoe UI';
     ctx.textAlign = 'center';
     ctx.lineWidth = 4;
     ctx.strokeStyle = 'rgba(0,0,0,0.75)';
-    const labelY = player.y - radius - 10;
-    ctx.strokeText(player.name, player.x, labelY);
+    const labelY = getPlayerAvatarLabelY(renderPlayer, carriedFlagTeam);
+    ctx.strokeText(renderPlayer.name, renderPlayer.x, labelY);
     ctx.fillStyle = '#ffffff';
-    ctx.fillText(player.name, player.x, labelY);
+    ctx.fillText(renderPlayer.name, renderPlayer.x, labelY);
     ctx.restore();
+  }
 
+  for (const key of playerAvatarStates.keys()) {
+    if (!activeAvatarStateKeys.has(key)) {
+      playerAvatarStates.delete(key);
+    }
   }
 }
+
 
 
 function drawMinimap() {
