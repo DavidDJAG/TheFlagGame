@@ -107,6 +107,22 @@ The logger records:
 
 Log rotation is enabled by `LocalFileLoggerProvider`: `log.txt` rotates at 5 MB and keeps 5 archived files (`log.1.txt` through `log.5.txt`).
 
+## Security hardening
+
+The server includes the following defensive controls:
+
+- CORS is restricted to the approved origins configured in `Program.cs`.
+- Local loopback origins are allowed for development, including `localhost`, `127.0.0.1`, and `::1` with arbitrary ports.
+- WebSocket handshakes validate the `Origin` header before accepting the connection.
+- `Origin: null` is accepted only for loopback requests.
+- The WebSocket endpoint rejects new clients when the server is full.
+- The match is limited to 32 connected players.
+- Incoming WebSocket messages are rate-limited per client.
+- Idle WebSocket clients are disconnected after 30 seconds without inbound messages.
+- `resetGame` is accepted only after at least 60 seconds of match time have elapsed.
+- `PUT /api/map` rejects request bodies larger than 1 MB.
+- Server-side map validation enforces strict limits before accepting or persisting a new map.
+
 ## Actual folder structure
 
 ```text

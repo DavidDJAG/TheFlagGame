@@ -336,21 +336,7 @@ Spawn zones are not drawn from map JSON. They are computed by the backend and re
 4. Play until the timer ends, or press **Reset Match** to restart immediately
 5. Optionally edit the map from `client-pwa/editor/`
 
-## Related documentation
-
-- [Root README](../README.md)
-- [Server README](../server/README.md)
-- [Editor README](./editor/README.md)
-
 ## Author
 
 **David Jorge Aguirre Grazio**  
 Developer
-
-## Iteración visual: retícula táctica
-
-- Se reemplazó la retícula simple anterior por una retícula cenital táctica basada en el asset adjunto.
-- El nuevo fondo incluye gradiente, capas de cuadrícula fina/media/mayor/sectorial, textura diagonal, puntos de intersección, etiquetas de sector y viñeta.
-- Se mantiene todo el gameplay, la velocidad de desplazamiento y la animación del avatar de la iteración anterior.
-- Service worker actualizado a `the-flag-shell-v8` para forzar actualización del shell PWA.
-
