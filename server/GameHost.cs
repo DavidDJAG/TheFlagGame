@@ -13,8 +13,24 @@ public sealed class GameHost
     private const float HitEffectLifetimeSeconds = 0.35f;
     private const int MaxIncomingMessageBytes = 16 * 1024;
     private const int MatchDurationSeconds = 5 * 60;
+    private const int MaxPlayers = 32;
+    private const int MaxMessagesPerRateLimitWindow = 200;
+    private const int MinCanvasWidth = 600;
+    private const int MinCanvasHeight = 400;
+    private const int MaxCanvasWidth = 4096;
+    private const int MaxCanvasHeight = 4096;
+    private const int MaxMapObjects = 256;
+    private const int MaxPointsPerPolygon = 64;
+    private const int MaxTotalPolygonPoints = 512;
+    private const int MaxHardObstacles = 160;
+    private const float MaxCoordinateMargin = 512f;
+    private const float MinShapeSize = 1f;
+    private const float MinPolygonArea = 4f;
     private static readonly TimeSpan ClientSendTimeout = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan MatchDuration = TimeSpan.FromSeconds(MatchDurationSeconds);
+    private static readonly TimeSpan MinimumResetElapsedTime = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan MaxClientIdleTime = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan RateLimitWindow = TimeSpan.FromSeconds(5);
 
     private readonly ILogger _logger;
     private readonly string _mapPath;
@@ -31,6 +47,8 @@ public sealed class GameHost
     private readonly List<HitEffectRuntime> _hitEffects = [];
     private readonly CancellationTokenSource _cts = new();
     private readonly Random _random = new();
+
+    private sealed record ClientRegistration(string PlayerId, string Team, string MapName, ConnectedClient Client);
 
     private Task? _loopTask;
     private int _blueScore;
@@ -51,6 +69,7 @@ public sealed class GameHost
     }
 
     public int TickRate => 20;
+    public int MaxPlayerCount => MaxPlayers;
     public int PlayerCount
     {
         get
@@ -83,7 +102,7 @@ public sealed class GameHost
         {
             nextMap = LoadMapFromJson(normalizedRawJson);
         }
-        catch (Exception ex) when (ex is JsonException or InvalidOperationException)
+        catch (Exception ex) when (ex is JsonException or InvalidOperationException or ArgumentException)
         {
             return new MapReplaceResult(false, 400, ex.Message);
         }
@@ -164,44 +183,33 @@ public sealed class GameHost
 
     public async Task HandleClientAsync(HttpContext context)
     {
-        using var socket = await context.WebSockets.AcceptWebSocketAsync();
-
-        string playerId;
-        string team;
-        string name;
-        string mapName;
-        Vec2 spawn;
-        ConnectedClient client;
-
+        var serverWasAlreadyFull = false;
         lock (_sync)
         {
-            if (_players.Count == 0)
-            {
-                ResetMatch();
-            }
-
-            playerId = $"p-{Guid.NewGuid():N}";
-            team = ChooseTeam();
-            name = team == "blue" ? $"Blue-{_players.Count + 1}" : $"Red-{_players.Count + 1}";
-            spawn = FindSpawn(team);
-            _players[playerId] = new PlayerRuntime
-            {
-                Id = playerId,
-                Name = name,
-                Team = team,
-                Position = spawn,
-                SpawnPosition = spawn,
-                Facing = team == "blue" ? new Vec2(1f, 0f) : new Vec2(-1f, 0f)
-            };
-
-            client = new ConnectedClient
-            {
-                PlayerId = playerId,
-                Socket = socket
-            };
-            _clients[playerId] = client;
-            mapName = Map.Source.Meta.Name;
+            serverWasAlreadyFull = _players.Count >= MaxPlayers;
         }
+
+        if (serverWasAlreadyFull)
+        {
+            context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+            await context.Response.WriteAsync("The game server is full.");
+            return;
+        }
+
+        using var socket = await context.WebSockets.AcceptWebSocketAsync();
+
+        var registration = TryAddClient(socket);
+        if (registration is null)
+        {
+            _logger.LogWarning("Rejected WebSocket client because the server already has {MaxPlayers} players.", MaxPlayers);
+            await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "server full", CancellationToken.None);
+            return;
+        }
+
+        var playerId = registration.PlayerId;
+        var team = registration.Team;
+        var mapName = registration.MapName;
+        var client = registration.Client;
 
         client.WriterTask = Task.Run(() => ClientWriterLoopAsync(client));
         _logger.LogInformation("Client connected {PlayerId} ({Team})", playerId, team);
@@ -232,6 +240,14 @@ public sealed class GameHost
                 var message = await ReceiveTextAsync(socket, context.RequestAborted);
                 if (message is null)
                 {
+                    break;
+                }
+
+                if (!TryRegisterClientMessage(playerId))
+                {
+                    closeStatus = WebSocketCloseStatus.PolicyViolation;
+                    closeDescription = "rate limit exceeded";
+                    _logger.LogWarning("Rate limit exceeded by {PlayerId}. Closing connection.", playerId);
                     break;
                 }
 
@@ -272,6 +288,50 @@ public sealed class GameHost
                     _logger.LogWarning(ex, "Could not close WebSocket cleanly for {PlayerId}.", playerId);
                 }
             }
+        }
+    }
+
+    private ClientRegistration? TryAddClient(WebSocket socket)
+    {
+        lock (_sync)
+        {
+            if (_players.Count >= MaxPlayers)
+            {
+                return null;
+            }
+
+            if (_players.Count == 0)
+            {
+                ResetMatch();
+            }
+
+            var playerId = $"p-{Guid.NewGuid():N}";
+            var team = ChooseTeam();
+            var name = team == "blue" ? $"Blue-{_players.Count + 1}" : $"Red-{_players.Count + 1}";
+            var spawn = FindSpawn(team);
+
+            _players[playerId] = new PlayerRuntime
+            {
+                Id = playerId,
+                Name = name,
+                Team = team,
+                Position = spawn,
+                SpawnPosition = spawn,
+                Facing = team == "blue" ? new Vec2(1f, 0f) : new Vec2(-1f, 0f)
+            };
+
+            var now = DateTimeOffset.UtcNow;
+            var client = new ConnectedClient
+            {
+                PlayerId = playerId,
+                Socket = socket,
+                LastReceivedAtUtc = now,
+                RateLimitWindowStartedAtUtc = now
+            };
+            _clients[playerId] = client;
+
+            var mapName = Map.Source.Meta.Name;
+            return new ClientRegistration(playerId, team, mapName, client);
         }
     }
 
@@ -366,8 +426,28 @@ public sealed class GameHost
                 }
                 else if (type == "resetGame")
                 {
-                    ResetMatch();
-                    _logger.LogInformation("Match reset requested by {PlayerId}", playerId);
+                    var now = DateTimeOffset.UtcNow;
+                    var elapsed = GetMatchElapsedTime(now);
+                    if (elapsed >= MinimumResetElapsedTime)
+                    {
+                        ResetMatch();
+                        _logger.LogInformation("Match reset requested by {PlayerId}", playerId);
+                    }
+                    else
+                    {
+                        var retryAfterMs = (long)Math.Ceiling((MinimumResetElapsedTime - elapsed).TotalMilliseconds);
+                        _logger.LogInformation(
+                            "Match reset rejected for {PlayerId}. Reset is available in {RetryAfterMs} ms.",
+                            playerId,
+                            retryAfterMs);
+
+                        TryQueueJson(client, new
+                        {
+                            type = "resetRejected",
+                            reason = "minimumMatchElapsedTime",
+                            retryAfterMs
+                        });
+                    }
                 }
             }
         }
@@ -386,16 +466,49 @@ public sealed class GameHost
         return element.TryGetProperty(propertyName, out var property) && property.ValueKind == JsonValueKind.True;
     }
 
+    private bool TryRegisterClientMessage(string playerId)
+    {
+        var now = DateTimeOffset.UtcNow;
+
+        lock (_sync)
+        {
+            if (!_clients.TryGetValue(playerId, out var client))
+            {
+                return false;
+            }
+
+            client.LastReceivedAtUtc = now;
+            if (now - client.RateLimitWindowStartedAtUtc >= RateLimitWindow)
+            {
+                client.RateLimitWindowStartedAtUtc = now;
+                client.MessagesInCurrentWindow = 0;
+            }
+
+            client.MessagesInCurrentWindow++;
+            return client.MessagesInCurrentWindow <= MaxMessagesPerRateLimitWindow;
+        }
+    }
+
+    private TimeSpan GetMatchElapsedTime(DateTimeOffset now)
+    {
+        if (now <= _matchStartedAtUtc)
+        {
+            return TimeSpan.Zero;
+        }
+
+        return now - _matchStartedAtUtc;
+    }
+
     private async Task GameLoopAsync()
     {
         var tickMs = 1000 / TickRate;
-        var last = DateTime.UtcNow;
+        var last = DateTimeOffset.UtcNow;
 
         while (!_cts.IsCancellationRequested)
         {
             try
             {
-                var now = DateTime.UtcNow;
+                var now = DateTimeOffset.UtcNow;
                 var dt = (float)(now - last).TotalSeconds;
                 if (dt <= 0f)
                 {
@@ -431,6 +544,13 @@ public sealed class GameHost
                     var client = item.Client;
                     if (client.Socket.State != WebSocketState.Open || client.IsStopRequested)
                     {
+                        deadClients.Add(client.PlayerId);
+                        continue;
+                    }
+
+                    if (now - client.LastReceivedAtUtc > MaxClientIdleTime)
+                    {
+                        _logger.LogInformation("Client {PlayerId} removed after more than {IdleSeconds} seconds without inbound messages.", client.PlayerId, MaxClientIdleTime.TotalSeconds);
                         deadClients.Add(client.PlayerId);
                         continue;
                     }
@@ -1505,10 +1625,7 @@ public sealed class GameHost
             PropertyNameCaseInsensitive = true
         }) ?? throw new InvalidOperationException("The map could not be deserialized.");
 
-        if (source.Objects.Count == 0)
-        {
-            throw new InvalidOperationException("The map does not contain any objects.");
-        }
+        ValidateMapDocument(source);
 
         var perimeterDto = source.Objects.SingleOrDefault(o => o.Type == "perimeter")
             ?? throw new InvalidOperationException("The map must contain a perimeter.");
@@ -1567,6 +1684,400 @@ public sealed class GameHost
             Obstacles = obstacles,
             FlagsByTeam = flagsByTeam
         };
+    }
+
+    private static void ValidateMapDocument(MapDocument source)
+    {
+        if (source.Meta is null)
+        {
+            throw new InvalidOperationException("The map metadata is missing.");
+        }
+
+        if (source.Meta.Canvas is null)
+        {
+            throw new InvalidOperationException("The map canvas metadata is missing.");
+        }
+
+        var canvasWidth = source.Meta.Canvas.Width;
+        var canvasHeight = source.Meta.Canvas.Height;
+        if (canvasWidth < MinCanvasWidth || canvasWidth > MaxCanvasWidth || canvasHeight < MinCanvasHeight || canvasHeight > MaxCanvasHeight)
+        {
+            throw new InvalidOperationException($"The canvas must be between {MinCanvasWidth}x{MinCanvasHeight} and {MaxCanvasWidth}x{MaxCanvasHeight} pixels.");
+        }
+
+        if (source.Objects is null || source.Objects.Count == 0)
+        {
+            throw new InvalidOperationException("The map does not contain any objects.");
+        }
+
+        if (source.Objects.Count > MaxMapObjects)
+        {
+            throw new InvalidOperationException($"The map contains {source.Objects.Count} objects. The maximum allowed is {MaxMapObjects}.");
+        }
+
+        var seenIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var hardObstacleCount = 0;
+        var totalPolygonPoints = 0;
+        var perimeterCount = 0;
+        var blueFlagCount = 0;
+        var redFlagCount = 0;
+
+        for (var i = 0; i < source.Objects.Count; i++)
+        {
+            var dto = source.Objects[i];
+            if (dto is null)
+            {
+                throw new InvalidOperationException($"Map object #{i + 1} is null.");
+            }
+
+            var objectLabel = GetObjectLabel(dto, i);
+            if (string.IsNullOrWhiteSpace(dto.Id))
+            {
+                throw new InvalidOperationException($"{objectLabel} does not have a valid id.");
+            }
+
+            if (!seenIds.Add(dto.Id.Trim()))
+            {
+                throw new InvalidOperationException($"The map contains a duplicated object id: '{dto.Id}'.");
+            }
+
+            if (string.IsNullOrWhiteSpace(dto.Type))
+            {
+                throw new InvalidOperationException($"{objectLabel} does not have a valid type.");
+            }
+
+            switch (dto.Type)
+            {
+                case "perimeter":
+                    perimeterCount++;
+                    if (!dto.Hard)
+                    {
+                        throw new InvalidOperationException($"{objectLabel} must be hard.");
+                    }
+
+                    ValidatePolygonObject(dto, objectLabel, canvasWidth, canvasHeight, ref totalPolygonPoints);
+                    break;
+
+                case "polygon":
+                    if (dto.Hard)
+                    {
+                        hardObstacleCount++;
+                    }
+
+                    ValidatePolygonObject(dto, objectLabel, canvasWidth, canvasHeight, ref totalPolygonPoints);
+                    break;
+
+                case "rect":
+                    if (dto.Hard)
+                    {
+                        hardObstacleCount++;
+                    }
+
+                    ValidateRectObject(dto, objectLabel, canvasWidth, canvasHeight);
+                    break;
+
+                case "circle":
+                    if (dto.Hard)
+                    {
+                        hardObstacleCount++;
+                    }
+
+                    ValidateCircleObject(dto, objectLabel, canvasWidth, canvasHeight);
+                    break;
+
+                case "flag":
+                    ValidateFlagObject(dto, objectLabel, canvasWidth, canvasHeight);
+                    if (dto.Team == "blue")
+                    {
+                        blueFlagCount++;
+                    }
+                    else if (dto.Team == "red")
+                    {
+                        redFlagCount++;
+                    }
+                    break;
+
+                default:
+                    throw new InvalidOperationException($"{objectLabel} has an unsupported type: '{dto.Type}'.");
+            }
+
+            if (hardObstacleCount > MaxHardObstacles)
+            {
+                throw new InvalidOperationException($"The map contains more than {MaxHardObstacles} hard obstacles.");
+            }
+        }
+
+        if (perimeterCount != 1)
+        {
+            throw new InvalidOperationException("The map must contain exactly one hard perimeter.");
+        }
+
+        if (blueFlagCount != 1 || redFlagCount != 1)
+        {
+            throw new InvalidOperationException("The map must contain exactly one blue flag and exactly one red flag.");
+        }
+
+        var perimeter = source.Objects.Single(o => o.Type == "perimeter");
+        var perimeterPoints = perimeter.Points!.Select(p => new Vec2(p.X, p.Y)).ToList();
+        foreach (var flag in source.Objects.Where(o => o.Type == "flag"))
+        {
+            var flagPosition = new Vec2(flag.X!.Value, flag.Y!.Value);
+            if (!Geometry.PointInPolygon(flagPosition, perimeterPoints))
+            {
+                throw new InvalidOperationException($"Flag '{flag.Id}' must be inside the perimeter.");
+            }
+        }
+    }
+
+    private static void ValidateRectObject(MapObjectDto dto, string objectLabel, int canvasWidth, int canvasHeight)
+    {
+        var x = RequireFinite(dto.X, $"{objectLabel}.x");
+        var y = RequireFinite(dto.Y, $"{objectLabel}.y");
+        var width = RequirePositiveFinite(dto.Width, $"{objectLabel}.width");
+        var height = RequirePositiveFinite(dto.Height, $"{objectLabel}.height");
+
+        RequireCoordinateInRange(x, canvasWidth, $"{objectLabel}.x");
+        RequireCoordinateInRange(y, canvasHeight, $"{objectLabel}.y");
+        RequireCoordinateInRange(x + width, canvasWidth, $"{objectLabel}.x + width");
+        RequireCoordinateInRange(y + height, canvasHeight, $"{objectLabel}.y + height");
+    }
+
+    private static void ValidateCircleObject(MapObjectDto dto, string objectLabel, int canvasWidth, int canvasHeight)
+    {
+        var x = RequireFinite(dto.X, $"{objectLabel}.x");
+        var y = RequireFinite(dto.Y, $"{objectLabel}.y");
+        var radius = RequirePositiveFinite(dto.Radius, $"{objectLabel}.radius");
+
+        RequireCoordinateInRange(x, canvasWidth, $"{objectLabel}.x");
+        RequireCoordinateInRange(y, canvasHeight, $"{objectLabel}.y");
+        RequireCoordinateInRange(x - radius, canvasWidth, $"{objectLabel}.x - radius");
+        RequireCoordinateInRange(x + radius, canvasWidth, $"{objectLabel}.x + radius");
+        RequireCoordinateInRange(y - radius, canvasHeight, $"{objectLabel}.y - radius");
+        RequireCoordinateInRange(y + radius, canvasHeight, $"{objectLabel}.y + radius");
+    }
+
+    private static void ValidateFlagObject(MapObjectDto dto, string objectLabel, int canvasWidth, int canvasHeight)
+    {
+        if (dto.Team is not "blue" and not "red")
+        {
+            throw new InvalidOperationException($"{objectLabel} must use team 'blue' or 'red'.");
+        }
+
+        if (dto.Hard)
+        {
+            throw new InvalidOperationException($"{objectLabel} must not be hard.");
+        }
+
+        var x = RequireFinite(dto.X, $"{objectLabel}.x");
+        var y = RequireFinite(dto.Y, $"{objectLabel}.y");
+        RequireCoordinateInsideCanvas(x, canvasWidth, $"{objectLabel}.x");
+        RequireCoordinateInsideCanvas(y, canvasHeight, $"{objectLabel}.y");
+    }
+
+    private static void ValidatePolygonObject(MapObjectDto dto, string objectLabel, int canvasWidth, int canvasHeight, ref int totalPolygonPoints)
+    {
+        if (dto.Points is null || dto.Points.Count < 3)
+        {
+            throw new InvalidOperationException($"{objectLabel} must contain at least 3 points.");
+        }
+
+        if (dto.Points.Count > MaxPointsPerPolygon)
+        {
+            throw new InvalidOperationException($"{objectLabel} contains {dto.Points.Count} points. The maximum allowed per polygon is {MaxPointsPerPolygon}.");
+        }
+
+        totalPolygonPoints += dto.Points.Count;
+        if (totalPolygonPoints > MaxTotalPolygonPoints)
+        {
+            throw new InvalidOperationException($"The map contains more than {MaxTotalPolygonPoints} polygon points in total.");
+        }
+
+        var points = new List<Vec2>(dto.Points.Count);
+        for (var i = 0; i < dto.Points.Count; i++)
+        {
+            var point = dto.Points[i];
+            if (point is null)
+            {
+                throw new InvalidOperationException($"{objectLabel}.points[{i}] is null.");
+            }
+
+            var x = RequireFinite(point.X, $"{objectLabel}.points[{i}].x");
+            var y = RequireFinite(point.Y, $"{objectLabel}.points[{i}].y");
+            RequireCoordinateInRange(x, canvasWidth, $"{objectLabel}.points[{i}].x");
+            RequireCoordinateInRange(y, canvasHeight, $"{objectLabel}.points[{i}].y");
+            points.Add(new Vec2(x, y));
+        }
+
+        if (CountDistinctPoints(points) < 3)
+        {
+            throw new InvalidOperationException($"{objectLabel} is degenerate because it has fewer than 3 distinct points.");
+        }
+
+        for (var i = 0; i < points.Count; i++)
+        {
+            var a = points[i];
+            var b = points[(i + 1) % points.Count];
+            if (Geometry.DistanceSquared(a, b) < MinShapeSize * MinShapeSize)
+            {
+                throw new InvalidOperationException($"{objectLabel} is degenerate because it contains a zero-length edge.");
+            }
+        }
+
+        if (MathF.Abs(GetSignedPolygonArea(points)) < MinPolygonArea)
+        {
+            throw new InvalidOperationException($"{objectLabel} is degenerate because its area is too small.");
+        }
+
+        if (HasSelfIntersections(points))
+        {
+            throw new InvalidOperationException($"{objectLabel} is degenerate because it has self-intersections.");
+        }
+    }
+
+    private static float RequireFinite(float? value, string label)
+    {
+        if (value is null || !float.IsFinite(value.Value))
+        {
+            throw new InvalidOperationException($"{label} must be a finite number.");
+        }
+
+        return value.Value;
+    }
+
+    private static float RequirePositiveFinite(float? value, string label)
+    {
+        var finiteValue = RequireFinite(value, label);
+        if (finiteValue <= 0f)
+        {
+            throw new InvalidOperationException($"{label} must be positive.");
+        }
+
+        return finiteValue;
+    }
+
+    private static void RequireCoordinateInRange(float value, int canvasAxisSize, string label)
+    {
+        if (value < -MaxCoordinateMargin || value > canvasAxisSize + MaxCoordinateMargin)
+        {
+            throw new InvalidOperationException($"{label} is outside the allowed coordinate range.");
+        }
+    }
+
+    private static void RequireCoordinateInsideCanvas(float value, int canvasAxisSize, string label)
+    {
+        if (value < 0f || value > canvasAxisSize)
+        {
+            throw new InvalidOperationException($"{label} must be inside the canvas.");
+        }
+    }
+
+    private static int CountDistinctPoints(IReadOnlyList<Vec2> points)
+    {
+        var count = 0;
+        const float epsilon = 0.001f;
+        for (var i = 0; i < points.Count; i++)
+        {
+            var isNew = true;
+            for (var j = 0; j < i; j++)
+            {
+                if (MathF.Abs(points[i].X - points[j].X) < epsilon && MathF.Abs(points[i].Y - points[j].Y) < epsilon)
+                {
+                    isNew = false;
+                    break;
+                }
+            }
+
+            if (isNew)
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    private static float GetSignedPolygonArea(IReadOnlyList<Vec2> points)
+    {
+        var sum = 0f;
+        for (var i = 0; i < points.Count; i++)
+        {
+            var a = points[i];
+            var b = points[(i + 1) % points.Count];
+            sum += a.X * b.Y - b.X * a.Y;
+        }
+
+        return sum * 0.5f;
+    }
+
+    private static bool HasSelfIntersections(IReadOnlyList<Vec2> points)
+    {
+        for (var i = 0; i < points.Count; i++)
+        {
+            var a1 = points[i];
+            var a2 = points[(i + 1) % points.Count];
+            for (var j = i + 1; j < points.Count; j++)
+            {
+                var edgesAreAdjacent = Math.Abs(i - j) == 1 || (i == 0 && j == points.Count - 1);
+                if (edgesAreAdjacent)
+                {
+                    continue;
+                }
+
+                var b1 = points[j];
+                var b2 = points[(j + 1) % points.Count];
+                if (SegmentsIntersect(a1, a2, b1, b2))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static bool SegmentsIntersect(Vec2 a, Vec2 b, Vec2 c, Vec2 d)
+    {
+        var o1 = Orientation(a, b, c);
+        var o2 = Orientation(a, b, d);
+        var o3 = Orientation(c, d, a);
+        var o4 = Orientation(c, d, b);
+
+        if (o1 != o2 && o3 != o4)
+        {
+            return true;
+        }
+
+        return (o1 == 0 && IsPointOnSegment(c, a, b))
+            || (o2 == 0 && IsPointOnSegment(d, a, b))
+            || (o3 == 0 && IsPointOnSegment(a, c, d))
+            || (o4 == 0 && IsPointOnSegment(b, c, d));
+    }
+
+    private static int Orientation(Vec2 a, Vec2 b, Vec2 c)
+    {
+        var value = Geometry.Cross(b - a, c - a);
+        if (MathF.Abs(value) < 0.0001f)
+        {
+            return 0;
+        }
+
+        return value > 0f ? 1 : 2;
+    }
+
+    private static bool IsPointOnSegment(Vec2 point, Vec2 a, Vec2 b)
+    {
+        const float epsilon = 0.0001f;
+        return point.X <= MathF.Max(a.X, b.X) + epsilon
+            && point.X + epsilon >= MathF.Min(a.X, b.X)
+            && point.Y <= MathF.Max(a.Y, b.Y) + epsilon
+            && point.Y + epsilon >= MathF.Min(a.Y, b.Y);
+    }
+
+    private static string GetObjectLabel(MapObjectDto dto, int index)
+    {
+        return string.IsNullOrWhiteSpace(dto.Id)
+            ? $"Map object #{index + 1}"
+            : $"Map object '{dto.Id}'";
     }
 
     private sealed record RayPlayerHit(PlayerRuntime Player, float Distance);

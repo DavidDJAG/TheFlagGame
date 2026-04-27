@@ -105,7 +105,7 @@ The logger records:
 - unexpected game-loop tick exceptions
 - match reset and match finished events
 
-No log rotation is implemented yet.
+Log rotation is enabled by `LocalFileLoggerProvider`: `log.txt` rotates at 5 MB and keeps 5 archived files (`log.1.txt` through `log.5.txt`).
 
 ## Actual folder structure
 
@@ -392,7 +392,6 @@ The WebSocket route forwards `Upgrade` and `Connection`, disables proxy bufferin
 - no friendly-fire filter
 - no advanced interpolation or reconciliation in the backend
 - no hot map reload while players are connected
-- no log rotation for `log.txt`
 
 ## Relationship with the editor
 

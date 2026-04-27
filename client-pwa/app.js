@@ -43,6 +43,7 @@ const STATE_WATCHDOG_INTERVAL_MS = 1000;
 const STATE_WATCHDOG_TIMEOUT_MS = 5000;
 const RECONNECT_BASE_DELAY_MS = 1000;
 const RECONNECT_MAX_DELAY_MS = 5000;
+const MAX_CONNECT_ATTEMPTS = 5;
 
 function normalizeBaseUrl(url) {
   return String(url || '').trim().replace(/\/+$/, '');
@@ -146,6 +147,7 @@ const state = {
   reconnectTimeoutId: null,
   lastStateReceivedAt: null,
   desiredOnline: false,
+  connectAttempts: 0,
   reconnectAttempts: 0,
   mobile: {
     enabled: false,
@@ -550,7 +552,7 @@ function setupEvents() {
     if (isOnline) {
       disconnect();
     } else {
-      connect();
+      connect({ resetAttempts: true });
     }
     closeMenu();
   });
@@ -948,14 +950,26 @@ function isTextInputFocused() {
   return document.activeElement === playerNameInput;
 }
 
-function connect() {
+function connect(options = {}) {
+  const { resetAttempts = false } = options;
   state.desiredOnline = true;
   clearReconnectTimer();
+
+  if (resetAttempts) {
+    state.connectAttempts = 0;
+    state.reconnectAttempts = 0;
+  }
 
   if (state.socket && (state.socket.readyState === WebSocket.OPEN || state.socket.readyState === WebSocket.CONNECTING)) {
     return;
   }
 
+  if (state.connectAttempts >= MAX_CONNECT_ATTEMPTS) {
+    stopConnectRetries();
+    return;
+  }
+
+  state.connectAttempts += 1;
   const socket = new WebSocket(WS_URL);
   state.socket = socket;
   setConnectionStatus('connecting');
@@ -965,6 +979,7 @@ function connect() {
 
   socket.addEventListener('open', () => {
     state.connected = true;
+    state.connectAttempts = 0;
     state.reconnectAttempts = 0;
     state.lastStateReceivedAt = performance.now();
     setConnectionStatus('connected');
@@ -1010,6 +1025,11 @@ function connect() {
       blueScoreEl.textContent = state.scores.blue;
       redScoreEl.textContent = state.scores.red;
       updateMatchHud();
+    }
+
+    if (message.type === 'resetRejected') {
+      const retryAfterSeconds = Math.max(1, Math.ceil(Number(message.retryAfterMs || 0) / 1000));
+      window.alert(`Reset will be available in ${retryAfterSeconds} second(s).`);
     }
   });
 
@@ -1068,6 +1088,8 @@ function requestMatchReset() {
 function disconnect() {
   state.desiredOnline = false;
   clearReconnectTimer();
+  state.connectAttempts = 0;
+  state.reconnectAttempts = 0;
   stopPingLoop();
   stopStateWatchdog();
   if (state.socket) {
@@ -1087,6 +1109,11 @@ function scheduleReconnect() {
     return;
   }
 
+  if (state.connectAttempts >= MAX_CONNECT_ATTEMPTS) {
+    stopConnectRetries();
+    return;
+  }
+
   const delay = Math.min(
     RECONNECT_MAX_DELAY_MS,
     RECONNECT_BASE_DELAY_MS * Math.max(1, 2 ** state.reconnectAttempts)
@@ -1094,14 +1121,22 @@ function scheduleReconnect() {
   state.reconnectAttempts += 1;
   setConnectionStatus('reconnecting');
   updateConnectButton();
-  updatePingLine('reconnecting...');
+  updatePingLine(`reconnecting... attempt ${state.connectAttempts + 1}/${MAX_CONNECT_ATTEMPTS}`);
 
   state.reconnectTimeoutId = window.setTimeout(() => {
     state.reconnectTimeoutId = null;
     if (state.desiredOnline) {
-      connect();
+      connect({ resetAttempts: false });
     }
   }, delay);
+}
+
+function stopConnectRetries() {
+  state.desiredOnline = false;
+  clearReconnectTimer();
+  setConnectionStatus('failed');
+  updateConnectButton();
+  updatePingLine(`connection failed after ${MAX_CONNECT_ATTEMPTS} attempts`);
 }
 
 function scheduleStateWatchdog() {

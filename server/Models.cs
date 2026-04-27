@@ -155,6 +155,9 @@ public sealed class ConnectedClient
     public required string PlayerId { get; init; }
     public required System.Net.WebSockets.WebSocket Socket { get; init; }
     public long? PendingPongNonce { get; set; }
+    public DateTimeOffset LastReceivedAtUtc { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset RateLimitWindowStartedAtUtc { get; set; } = DateTimeOffset.UtcNow;
+    public int MessagesInCurrentWindow { get; set; }
     public Channel<string> Outbound { get; }
     public CancellationTokenSource SendCancellation { get; } = new();
     public Task? WriterTask { get; set; }
