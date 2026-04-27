@@ -34,7 +34,7 @@ const DEFAULT_PUBLIC_PATH = '';
 const EARTH_COLORS = ['#54493b', '#635644', '#72624e', '#816e57', '#8e7a5e', '#9c8666', '#aa906e', '#b89b75', '#c5a67c', '#d2b183'];
 const JOYSTICK_RADIUS = 44;
 const JOYSTICK_DEADZONE = 14;
-const HIT_EFFECT_DURATION_MS = 320;
+const HIT_EFFECT_DURATION_MS = 620;
 const IMPACT_SPARK_DURATION_MS = 180;
 const RECENT_PLAYER_IMPACT_TTL_MS = 180;
 const PLAYER_IMPACT_PROXIMITY_PX = 14;
@@ -135,6 +135,12 @@ const state = {
   effects: [],
   seenEventIds: new Map(),
   recentPlayerImpacts: [],
+  screenShake: {
+    ageMs: 9999,
+    durationMs: 0,
+    strengthPx: 0,
+    seed: 0,
+  },
   lastFrameTime: null,
   input: { up: false, down: false, left: false, right: false },
   mapName: '-',
@@ -534,7 +540,16 @@ function applyWorldTransform() {
   const viewHeight = Math.max(1, state.camera.viewHeight || world.height);
   const scaleX = canvas.width / viewWidth;
   const scaleY = canvas.height / viewHeight;
-  ctx.setTransform(scaleX, 0, 0, scaleY, -state.camera.x * scaleX, -state.camera.y * scaleY);
+  const shake = getScreenShakeOffset();
+
+  ctx.setTransform(
+    scaleX,
+    0,
+    0,
+    scaleY,
+    -state.camera.x * scaleX + shake.x,
+    -state.camera.y * scaleY + shake.y
+  );
 }
 
 function resetScreenTransform() {
@@ -1237,7 +1252,8 @@ function updateMyTeamFromState() {
     return;
   }
 
-  const me = state.players.find((player) => player.id === state.myPlayerId);
+  const localId = String(state.myPlayerId);
+  const me = state.players.find((player) => String(player.id) === localId);
   if (!me || (me.team !== 'blue' && me.team !== 'red')) {
     return;
   }
@@ -1434,8 +1450,9 @@ function draw() {
   drawMap();
   drawFlags();
   drawShots();
-  drawEffects();
+  drawEffects('under');
   drawPlayers();
+  drawEffects('over');
   ctx.restore();
   drawMinimap();
   drawOverlay();
@@ -1673,6 +1690,72 @@ function drawFlags() {
 }
 
 
+function triggerScreenShake(strengthPx = 5, durationMs = 130) {
+  state.screenShake.ageMs = 0;
+  state.screenShake.durationMs = durationMs;
+  state.screenShake.strengthPx = strengthPx;
+  state.screenShake.seed = Math.random() * 1000;
+}
+
+function updateScreenShake(dtMs) {
+  if (!dtMs || !state.screenShake || state.screenShake.ageMs >= state.screenShake.durationMs) {
+    return;
+  }
+
+  state.screenShake.ageMs += dtMs;
+}
+
+function getScreenShakeOffset() {
+  const shake = state.screenShake;
+
+  if (!shake || shake.ageMs >= shake.durationMs) {
+    return { x: 0, y: 0 };
+  }
+
+  const progress = clamp(shake.ageMs / Math.max(1, shake.durationMs), 0, 1);
+  const amplitude = shake.strengthPx * Math.pow(1 - progress, 2);
+  const phase = shake.seed + shake.ageMs * 0.09;
+
+  return {
+    x: Math.cos(phase * 2.13) * amplitude,
+    y: Math.sin(phase * 2.87) * amplitude,
+  };
+}
+
+function shouldShakeOnHit(gameEvent) {
+  const localId = String(state.myPlayerId || '');
+  const eventPlayerIds = [
+    gameEvent.shooterId,
+    gameEvent.victimId,
+    gameEvent.playerId,
+    gameEvent.targetId,
+    gameEvent.hitPlayerId,
+    gameEvent.targetPlayerId,
+  ]
+    .filter((value) => value !== undefined && value !== null)
+    .map((value) => String(value));
+
+  if (localId && eventPlayerIds.includes(localId)) {
+    return true;
+  }
+
+  const me = state.players.find((player) => player.id === state.myPlayerId);
+
+  if (!me) {
+    return false;
+  }
+
+  const impactX = Number(gameEvent.impactX);
+  const impactY = Number(gameEvent.impactY);
+
+  if (!Number.isFinite(impactX) || !Number.isFinite(impactY)) {
+    return false;
+  }
+
+  return Math.hypot(me.x - impactX, me.y - impactY) <= 220;
+}
+
+
 function processServerEvents(events) {
   const now = performance.now();
   pruneSeenEventIds(now);
@@ -1690,6 +1773,10 @@ function processServerEvents(events) {
     state.seenEventIds.set(eventId, now);
     rememberPlayerImpact(gameEvent.impactX, gameEvent.impactY, now);
     spawnHitExplosion(gameEvent.impactX, gameEvent.impactY, gameEvent.shooterTeam || gameEvent.victimTeam);
+
+    if (shouldShakeOnHit(gameEvent)) {
+      triggerScreenShake(5, 130);
+    }
   }
 }
 
@@ -1776,33 +1863,45 @@ function pruneSeenEventIds(now) {
 function spawnHitExplosion(x, y, team) {
   const impactX = Number(x);
   const impactY = Number(y);
+
   if (!Number.isFinite(impactX) || !Number.isFinite(impactY)) {
     return;
   }
 
-  const particleCount = 12 + Math.floor(Math.random() * 6);
+  const particleCount = 34 + Math.floor(Math.random() * 10);
   const particles = [];
 
   for (let index = 0; index < particleCount; index += 1) {
-    const angle = (Math.PI * 2 * index) / particleCount + (Math.random() - 0.5) * 0.24;
+    const isStreak = index % 3 === 0;
+    const angle = (Math.PI * 2 * index) / particleCount + (Math.random() - 0.5) * 0.5;
+
     particles.push({
       angle,
-      speed: 70 + Math.random() * 115,
-      radius: 2 + Math.random() * 2.8,
-      drift: (Math.random() - 0.5) * 16,
+      speed: isStreak ? 210 + Math.random() * 150 : 80 + Math.random() * 130,
+      radius: isStreak ? 1.2 + Math.random() * 1.2 : 1.8 + Math.random() * 2.6,
+      length: isStreak ? 14 + Math.random() * 20 : 5 + Math.random() * 8,
+      drift: (Math.random() - 0.5) * 28,
+      delay: Math.random() * 70,
+      kind: isStreak ? 'streak' : 'ember',
     });
   }
 
   state.effects.push({
     id: `fx-${Math.random().toString(36).slice(2, 10)}`,
     type: 'hitExplosion',
+    layer: 'over',
     x: impactX,
     y: impactY,
     team,
     ageMs: 0,
     durationMs: HIT_EFFECT_DURATION_MS,
+    rotation: Math.random() * Math.PI * 2,
     particles,
   });
+
+  if (state.effects.length > 48) {
+    state.effects.splice(0, state.effects.length - 48);
+  }
 }
 
 function spawnImpactSpark(x, y, team) {
@@ -1828,6 +1927,7 @@ function spawnImpactSpark(x, y, team) {
   state.effects.push({
     id: `fx-${Math.random().toString(36).slice(2, 10)}`,
     type: 'impactSpark',
+    layer: 'under',
     x: impactX,
     y: impactY,
     team,
@@ -1838,6 +1938,8 @@ function spawnImpactSpark(x, y, team) {
 }
 
 function updateEffects(dtMs) {
+  updateScreenShake(dtMs);
+
   if (!dtMs || state.effects.length === 0) {
     return;
   }
@@ -1851,36 +1953,132 @@ function updateEffects(dtMs) {
   }
 }
 
+function easeOutCubic(value) {
+  const t = clamp(Number(value) || 0, 0, 1);
+  return 1 - Math.pow(1 - t, 3);
+}
+
 function drawHitExplosionEffect(effect) {
-  const progress = Math.min(1, effect.ageMs / effect.durationMs);
-  const fade = 1 - progress;
+  const progress = clamp(effect.ageMs / effect.durationMs, 0, 1);
+  const eased = easeOutCubic(progress);
+  const fade = Math.pow(1 - progress, 1.15);
   const accentColor = TEAM_COLORS[effect.team] || '#ffffff';
 
   ctx.save();
   ctx.globalCompositeOperation = 'lighter';
 
-  const shockwaveRadius = 7 + progress * 26;
-  ctx.lineWidth = 2 + fade * 2;
-  ctx.strokeStyle = toRgba(accentColor, 0.85 * fade);
-  ctx.beginPath();
-  ctx.arc(effect.x, effect.y, shockwaveRadius, 0, Math.PI * 2);
-  ctx.stroke();
+  const flashRadius = 16 + eased * 54;
+  const flash = ctx.createRadialGradient(
+    effect.x,
+    effect.y,
+    1,
+    effect.x,
+    effect.y,
+    flashRadius
+  );
 
-  ctx.fillStyle = toRgba('#ffffff', 0.55 * fade);
+  flash.addColorStop(0, toRgba('#ffffff', 0.95 * fade));
+  flash.addColorStop(0.24, toRgba(accentColor, 0.6 * fade));
+  flash.addColorStop(1, toRgba(accentColor, 0));
+
+  ctx.fillStyle = flash;
   ctx.beginPath();
-  ctx.arc(effect.x, effect.y, 5 + progress * 6, 0, Math.PI * 2);
+  ctx.arc(effect.x, effect.y, flashRadius, 0, Math.PI * 2);
   ctx.fill();
 
-  for (const particle of effect.particles) {
-    const travel = 8 + particle.speed * (effect.ageMs / 1000);
-    const px = effect.x + Math.cos(particle.angle) * travel + Math.cos(effect.ageMs / 90 + particle.angle) * particle.drift * progress;
-    const py = effect.y + Math.sin(particle.angle) * travel + Math.sin(effect.ageMs / 110 + particle.angle) * particle.drift * progress;
-    const radius = Math.max(0.8, particle.radius * (1 - progress * 0.75));
+  for (let ringIndex = 0; ringIndex < 3; ringIndex += 1) {
+    const ringProgress = clamp(progress * 1.2 - ringIndex * 0.14, 0, 1);
 
-    ctx.fillStyle = toRgba(accentColor, 0.95 * fade);
+    if (ringProgress <= 0) {
+      continue;
+    }
+
+    const ringFade = Math.pow(1 - ringProgress, 1.4) * fade;
+    const radius = 10 + ringProgress * (32 + ringIndex * 13);
+
+    ctx.lineWidth = 2.8 - ringIndex * 0.45;
+    ctx.strokeStyle = toRgba(ringIndex === 0 ? '#ffffff' : accentColor, 0.85 * ringFade);
     ctx.beginPath();
-    ctx.arc(px, py, radius, 0, Math.PI * 2);
-    ctx.fill();
+    ctx.arc(effect.x, effect.y, radius, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  ctx.save();
+  ctx.translate(effect.x, effect.y);
+  ctx.rotate((effect.rotation || 0) + progress * 0.35);
+
+  const markerSize = 14 + Math.sin(progress * Math.PI) * 14;
+  const markerInner = markerSize * 0.42;
+
+  ctx.lineCap = 'round';
+  ctx.lineWidth = 2.5 + fade * 1.5;
+  ctx.strokeStyle = toRgba('#ffffff', 0.9 * fade);
+
+  ctx.beginPath();
+  for (const sx of [-1, 1]) {
+    for (const sy of [-1, 1]) {
+      ctx.moveTo(sx * markerSize, sy * markerSize);
+      ctx.lineTo(sx * markerInner, sy * markerInner);
+    }
+  }
+  ctx.stroke();
+
+  ctx.lineWidth = 1.4;
+  ctx.strokeStyle = toRgba(accentColor, 0.9 * fade);
+  ctx.stroke();
+
+  ctx.restore();
+
+  for (const particle of effect.particles) {
+    const localAge = effect.ageMs - (particle.delay || 0);
+
+    if (localAge <= 0) {
+      continue;
+    }
+
+    const localProgress = clamp(localAge / Math.max(1, effect.durationMs - (particle.delay || 0)), 0, 1);
+    const particleFade = Math.pow(1 - localProgress, 1.35);
+    const travel = 7 + particle.speed * (localAge / 1000);
+    const drift = particle.drift * localProgress;
+
+    const px =
+      effect.x +
+      Math.cos(particle.angle) * travel +
+      Math.cos(effect.ageMs / 80 + particle.angle) * drift;
+
+    const py =
+      effect.y +
+      Math.sin(particle.angle) * travel +
+      Math.sin(effect.ageMs / 95 + particle.angle) * drift;
+
+    if (particle.kind === 'streak') {
+      const tailX = px - Math.cos(particle.angle) * particle.length * (1 - localProgress * 0.35);
+      const tailY = py - Math.sin(particle.angle) * particle.length * (1 - localProgress * 0.35);
+
+      ctx.lineCap = 'round';
+      ctx.lineWidth = Math.max(0.8, particle.radius * (1 - localProgress * 0.55));
+      ctx.strokeStyle = toRgba(accentColor, 0.88 * particleFade);
+      ctx.beginPath();
+      ctx.moveTo(tailX, tailY);
+      ctx.lineTo(px, py);
+      ctx.stroke();
+
+      ctx.strokeStyle = toRgba('#ffffff', 0.55 * particleFade);
+      ctx.lineWidth = 0.8;
+      ctx.stroke();
+    } else {
+      const radius = Math.max(0.6, particle.radius * (1 - localProgress * 0.75));
+
+      ctx.fillStyle = toRgba(accentColor, 0.86 * particleFade);
+      ctx.beginPath();
+      ctx.arc(px, py, radius, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = toRgba('#ffffff', 0.45 * particleFade);
+      ctx.beginPath();
+      ctx.arc(px, py, radius * 0.45, 0, Math.PI * 2);
+      ctx.fill();
+    }
   }
 
   ctx.restore();
@@ -1920,12 +2118,18 @@ function drawImpactSparkEffect(effect) {
   ctx.restore();
 }
 
-function drawEffects() {
+function drawEffects(layer = 'under') {
   if (state.effects.length === 0) {
     return;
   }
 
   for (const effect of state.effects) {
+    const effectLayer = effect.layer || 'under';
+
+    if (effectLayer !== layer) {
+      continue;
+    }
+
     if (effect.type === 'hitExplosion') {
       drawHitExplosionEffect(effect);
       continue;
