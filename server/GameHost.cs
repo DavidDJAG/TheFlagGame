@@ -260,9 +260,17 @@ public sealed class GameHost
             closeDescription = "incoming message too large or invalid";
             _logger.LogWarning(ex, "Rejected WebSocket message from {PlayerId}.", playerId);
         }
+        catch (OperationCanceledException) when (IsExpectedWebSocketStop(client, socket, context))
+        {
+            _logger.LogInformation("WebSocket receive loop ended for {PlayerId}.", playerId);
+        }
         catch (OperationCanceledException ex)
         {
-            _logger.LogInformation(ex, "WebSocket receive loop canceled for {PlayerId}.", playerId);
+            _logger.LogWarning(ex, "Unexpected WebSocket receive cancellation for {PlayerId}.", playerId);
+        }
+        catch (WebSocketException ex) when (IsExpectedWebSocketClose(ex, client, socket, context))
+        {
+            _logger.LogInformation("WebSocket closed without clean handshake for {PlayerId}.", playerId);
         }
         catch (WebSocketException ex)
         {
@@ -282,6 +290,14 @@ public sealed class GameHost
                 try
                 {
                     await socket.CloseAsync(closeStatus, closeDescription, CancellationToken.None);
+                }
+                catch (OperationCanceledException) when (IsExpectedWebSocketStop(client, socket, context))
+                {
+                    _logger.LogInformation("WebSocket close handshake canceled for {PlayerId}.", playerId);
+                }
+                catch (WebSocketException ex) when (IsExpectedWebSocketClose(ex, client, socket, context))
+                {
+                    _logger.LogInformation("WebSocket close handshake was not completed for {PlayerId}.", playerId);
                 }
                 catch (Exception ex)
                 {
@@ -1342,13 +1358,17 @@ public sealed class GameHost
                 await SendRawJsonDirectAsync(client.Socket, payload, client.SendCancellation.Token);
             }
         }
-        catch (OperationCanceledException ex) when (client.IsStopRequested || _cts.IsCancellationRequested)
+        catch (OperationCanceledException) when (IsExpectedWebSocketStop(client, client.Socket))
         {
-            _logger.LogInformation(ex, "WebSocket writer stopped for {PlayerId}.", client.PlayerId);
+            _logger.LogInformation("WebSocket writer stopped for {PlayerId}.", client.PlayerId);
         }
         catch (OperationCanceledException ex)
         {
             _logger.LogWarning(ex, "WebSocket send timed out for {PlayerId}.", client.PlayerId);
+        }
+        catch (WebSocketException ex) when (IsExpectedWebSocketClose(ex, client, client.Socket))
+        {
+            _logger.LogInformation("WebSocket writer ended because the socket was closed for {PlayerId}.", client.PlayerId);
         }
         catch (WebSocketException ex)
         {
@@ -1365,6 +1385,25 @@ public sealed class GameHost
                 RemoveClient(client.PlayerId, abortSocket: true);
             }
         }
+    }
+
+    private bool IsExpectedWebSocketStop(ConnectedClient client, WebSocket socket, HttpContext? context = null)
+    {
+        return client.IsStopRequested
+            || _cts.IsCancellationRequested
+            || context?.RequestAborted.IsCancellationRequested == true
+            || IsTerminalWebSocketState(socket.State);
+    }
+
+    private bool IsExpectedWebSocketClose(WebSocketException ex, ConnectedClient client, WebSocket socket, HttpContext? context = null)
+    {
+        return ex.WebSocketErrorCode == WebSocketError.ConnectionClosedPrematurely
+            || IsExpectedWebSocketStop(client, socket, context);
+    }
+
+    private static bool IsTerminalWebSocketState(WebSocketState state)
+    {
+        return state is WebSocketState.Aborted or WebSocketState.Closed or WebSocketState.CloseReceived;
     }
 
     private static async Task SendRawJsonDirectAsync(WebSocket socket, string payload, CancellationToken cancellationToken)

@@ -2,6 +2,7 @@ using System.Net;
 using System.Text;
 using TheFlag.Server;
 using Microsoft.Extensions.FileProviders;
+using Microsoft.Extensions.Logging;
 
 var builder = WebApplication.CreateSlimBuilder(args);
 
@@ -15,6 +16,11 @@ var allowedOrigins = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     "http://127.0.0.1"
 };
 
+builder.Logging.AddFilter("Microsoft.AspNetCore.Hosting.Diagnostics", LogLevel.Warning);
+builder.Logging.AddFilter("Microsoft.AspNetCore.Routing.EndpointMiddleware", LogLevel.Warning);
+builder.Logging.AddFilter("Microsoft.AspNetCore.Http.Result", LogLevel.Warning);
+builder.Logging.AddFilter("Microsoft.AspNetCore.Cors.Infrastructure.CorsService", LogLevel.Warning);
+builder.Logging.AddFilter("Microsoft.AspNetCore.Server.Kestrel.Connections", LogLevel.Warning);
 builder.Logging.AddProvider(new LocalFileLoggerProvider(
     Path.Combine(AppContext.BaseDirectory, "log.txt"),
     maxFileBytes: 5 * 1024 * 1024,

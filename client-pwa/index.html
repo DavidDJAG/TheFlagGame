@@ -42,6 +42,16 @@
           </div>
           <div class="shoot-zone" id="shootZone" aria-label="Touch shooting control"></div>
         </div>
+
+        <div class="home-screen" id="homeScreen" aria-hidden="false">
+          <video class="home-video" id="homeVideo" src="./home.mp4" autoplay muted loop playsinline preload="metadata" aria-hidden="true"></video>
+          <div class="home-video-shade" aria-hidden="true"></div>
+          <div class="home-copy">
+            <img class="home-logo" src="./logoweb.png" alt="The Flag logo">
+            <p class="home-kicker">Capture the flag</p>
+            <p class="home-message" id="homeMessage">Open the menu and press Connect to join</p>
+          </div>
+        </div>
       </div>
     </main>
 
@@ -99,7 +109,6 @@
           <ul>
             <li>Desktop: WASD or arrow keys to move, space or click to shoot.</li>
             <li>Mobile: joystick on the left and shooting by tapping the right half.</li>
-            <li>In portrait mode, the game uses a vertical camera and minimap to preserve visibility.</li>
           </ul>
         </div>
       </div>

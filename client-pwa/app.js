@@ -28,6 +28,9 @@ const moveZoneEl = document.getElementById('moveZone');
 const joystickBaseEl = document.getElementById('joystickBase');
 const joystickStickEl = document.getElementById('joystickStick');
 const shootZoneEl = document.getElementById('shootZone');
+const homeScreenEl = document.getElementById('homeScreen');
+const homeMessageEl = document.getElementById('homeMessage');
+const homeVideoEl = document.getElementById('homeVideo');
 
 const DEFAULT_HTTP_SERVER_BASE = 'http://127.0.0.1:5770';
 const DEFAULT_PUBLIC_PATH = '';
@@ -428,6 +431,7 @@ async function boot() {
   updateTouchLayout();
   updateInstallAvailability();
   updateConnectButton();
+  updateHomeScreen();
   updatePingLine();
   updateMatchHud();
   syncMenuState();
@@ -778,6 +782,7 @@ function shouldHandleMobilePointer(event) {
 function handleViewportChange() {
   updateLayoutMetrics();
   updateTouchLayout();
+  updateHomeScreen();
 }
 
 function updateLayoutMetrics() {
@@ -829,6 +834,7 @@ function updateTouchLayout() {
   document.body.classList.toggle('touch-portrait', portraitTouch);
   mobileControlsEl.setAttribute('aria-hidden', state.mobile.enabled ? 'false' : 'true');
   rotateHintEl.setAttribute('aria-hidden', 'true');
+  updateHomeScreen();
 
   updateLayoutMetrics();
 
@@ -1321,6 +1327,57 @@ function updateConnectButton() {
   connectToggleBtn.textContent = isOnline ? 'Disconnect' : 'Connect';
   resetGameBtn.disabled = !state.connected;
   matchResultResetBtn.disabled = !state.connected;
+  updateHomeScreen();
+}
+
+function getHomeMessage() {
+  const socket = state.socket;
+  const socketState = socket ? socket.readyState : 3;
+  const statusText = connectionStatusEl.textContent;
+
+  if (!state.connected && (statusText === 'connecting' || (state.desiredOnline && socketState === 0))) {
+    return 'Connecting...';
+  }
+
+  if (!state.connected && (statusText === 'reconnecting' || (state.desiredOnline && state.reconnectTimeoutId))) {
+    return 'Reconnecting...';
+  }
+
+  if (!state.connected && statusText === 'failed') {
+    return 'Connection failed. Open the menu and press Connect to try again';
+  }
+
+  if (!state.connected && statusText === 'error') {
+    return 'Connection error. Open the menu and press Connect to try again';
+  }
+
+  return state.mobile.enabled
+    ? 'Open the menu and tap Connect to join'
+    : 'Open the menu and press Connect to join';
+}
+
+function updateHomeScreen() {
+  if (!homeScreenEl || !homeMessageEl) {
+    return;
+  }
+
+  const showHome = !state.connected;
+  canvasWrapEl.classList.toggle('preconnect-mode', showHome);
+  homeScreenEl.setAttribute('aria-hidden', showHome ? 'false' : 'true');
+  homeMessageEl.textContent = getHomeMessage();
+
+  if (!homeVideoEl) {
+    return;
+  }
+
+  if (showHome) {
+    const playPromise = homeVideoEl.play();
+    if (playPromise && typeof playPromise.catch === 'function') {
+      playPromise.catch(() => {});
+    }
+  } else {
+    homeVideoEl.pause();
+  }
 }
 
 function updateInstallAvailability() {
@@ -2871,21 +2928,6 @@ function roundRect(context, x, y, width, height, radius) {
 }
 
 function drawOverlay() {
-  if (!state.connected) {
-    ctx.save();
-    resetScreenTransform();
-    ctx.fillStyle = 'rgba(10, 10, 15, 0.58)';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.fillStyle = '#ffffff';
-    ctx.textAlign = 'center';
-    ctx.font = `400 ${Math.max(22, Math.round(canvas.width * 0.05))}px Segoe UI`;
-    const message = state.mobile.enabled
-      ? 'Open the menu and tap Connect to join'
-      : 'Open the menu and press Connect to join';
-    ctx.fillText(message, canvas.width / 2, canvas.height / 2 - 10);
-    ctx.restore();
-  }
-
   if (state.myPlayerId) {
     const player = state.players.find((item) => item.id === state.myPlayerId);
     if (player && player.team !== state.myTeam) {
