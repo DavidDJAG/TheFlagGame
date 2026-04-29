@@ -34,11 +34,6 @@ const homeVideoEl = document.getElementById('homeVideo');
 
 const DEFAULT_HTTP_SERVER_BASE = 'http://127.0.0.1:5770';
 const DEFAULT_PUBLIC_PATH = '';
-const PRODUCTION_FRONTEND_ORIGINS = new Set([
-  'https://www.mcrenox.com.ar'
-]);
-const PRODUCTION_BACKEND_BASE = 'https://server.mcrenox.com';
-const PRODUCTION_BACKEND_PUBLIC_PATH = '/theflag';
 const EARTH_COLORS = ['#54493b', '#635644', '#72624e', '#816e57', '#8e7a5e', '#9c8666', '#aa906e', '#b89b75', '#c5a67c', '#d2b183'];
 const JOYSTICK_RADIUS = 44;
 const JOYSTICK_DEADZONE = 14;
@@ -84,15 +79,6 @@ function getRuntimeConfig() {
     return {
       serverBase: normalizeBaseUrl(explicitBase),
       publicPath: normalizePublicPath(explicitPublicPath || inferPublicPathFromLocation(window.location.pathname))
-    };
-  }
-
-  const currentOrigin = normalizeBaseUrl(window.location.origin);
-
-  if (PRODUCTION_FRONTEND_ORIGINS.has(currentOrigin)) {
-    return {
-      serverBase: PRODUCTION_BACKEND_BASE,
-      publicPath: PRODUCTION_BACKEND_PUBLIC_PATH
     };
   }
 
