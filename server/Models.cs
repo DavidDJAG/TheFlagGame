@@ -153,6 +153,7 @@ public sealed class ConnectedClient
     }
 
     public required string PlayerId { get; init; }
+    public required string RoomId { get; init; }
     public required System.Net.WebSockets.WebSocket Socket { get; init; }
     public long? PendingPongNonce { get; set; }
     public DateTimeOffset LastReceivedAtUtc { get; set; } = DateTimeOffset.UtcNow;
@@ -190,6 +191,20 @@ public sealed class ConnectedClient
     }
 }
 
+public sealed record RoomSummary(
+    string RoomId,
+    int PlayerCount,
+    int MaxPlayers,
+    string MapName,
+    string MatchStatus);
+
+public sealed record RoomManagerSummary(
+    int ActiveRooms,
+    int MaxActiveRooms,
+    int TotalPlayers,
+    int MaxPlayersPerRoom);
+
+public sealed record CreateRoomRequest(string? RoomId);
 
 public sealed record MapReplaceResult(bool Success, int StatusCode, string Message, string? MapName = null, int? ObjectCount = null);
 

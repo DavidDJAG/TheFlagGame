@@ -4,6 +4,7 @@ const canvasWrapEl = document.getElementById('canvasWrap');
 const connectToggleBtn = document.getElementById('connectToggleBtn');
 const resetGameBtn = document.getElementById('resetGameBtn');
 const installAppBtn = document.getElementById('installAppBtn');
+const roomIdInput = document.getElementById('roomId');
 const playerNameInput = document.getElementById('playerName');
 const connectionStatusEl = document.getElementById('connectionStatus');
 const gameInfoLine1El = document.getElementById('gameInfoLine1');
@@ -52,6 +53,9 @@ const STATE_WATCHDOG_TIMEOUT_MS = 5000;
 const RECONNECT_BASE_DELAY_MS = 1000;
 const RECONNECT_MAX_DELAY_MS = 5000;
 const MAX_CONNECT_ATTEMPTS = 5;
+const DEFAULT_ROOM_ID = 'public';
+const ROOM_ID_STORAGE_KEY = 'ctf-room-id';
+const ROOM_ID_PATTERN = /^[a-z0-9_-]{1,32}$/;
 
 function normalizeBaseUrl(url) {
   return String(url || '').trim().replace(/\/+$/, '');
@@ -128,6 +132,56 @@ const PUBLIC_PATH = runtimeConfig.publicPath;
 const API_BASE = `${HTTP_SERVER_BASE}${PUBLIC_PATH}/api`;
 const WS_URL = `${toWebSocketBase(HTTP_SERVER_BASE)}${PUBLIC_PATH}/ws`;
 
+function normalizeRoomId(value) {
+  const cleaned = String(value || '').trim().toLowerCase();
+  return cleaned || DEFAULT_ROOM_ID;
+}
+
+function isValidRoomId(roomId) {
+  return ROOM_ID_PATTERN.test(roomId);
+}
+
+function getInitialRoomId() {
+  const params = new URLSearchParams(window.location.search);
+  const fromQuery = params.get('room');
+  const fromStorage = localStorage.getItem(ROOM_ID_STORAGE_KEY);
+  const roomId = normalizeRoomId(fromQuery || fromStorage || DEFAULT_ROOM_ID);
+  return isValidRoomId(roomId) ? roomId : DEFAULT_ROOM_ID;
+}
+
+function getDesiredRoomId({ alertOnInvalid = false } = {}) {
+  const roomId = normalizeRoomId(roomIdInput.value);
+  roomIdInput.value = roomId;
+
+  if (!isValidRoomId(roomId)) {
+    setConnectionStatus('invalid room');
+    updatePingLine('room must use a-z, 0-9, _ or - and max 32 chars');
+    if (alertOnInvalid) {
+      window.alert('Invalid room. Use 1-32 characters: lowercase letters, numbers, hyphen, or underscore.');
+    }
+    updateConnectButton();
+    return null;
+  }
+
+  localStorage.setItem(ROOM_ID_STORAGE_KEY, roomId);
+  return roomId;
+}
+
+function buildWebSocketUrl(roomId) {
+  const url = new URL(WS_URL);
+  url.searchParams.set('room', roomId);
+  return url.toString();
+}
+
+function getDisplayedRoomId() {
+  return state.currentRoomId || normalizeRoomId(roomIdInput.value);
+}
+
+function updateMapInfoLine() {
+  gameInfoLine1El.textContent = `Map: ${state.mapName} · Room: ${getDisplayedRoomId()}`;
+}
+
+
 const state = {
   socket: null,
   connected: false,
@@ -161,6 +215,7 @@ const state = {
   lastFrameTime: null,
   input: { up: false, down: false, left: false, right: false },
   mapName: '-',
+  currentRoomId: null,
   pingMs: null,
   pingIntervalId: null,
   inputIntervalId: null,
@@ -435,7 +490,9 @@ function setCanvasAccent(team) {
   canvasWrapEl.style.setProperty('--canvas-accent-glow', glow);
 }
 
+roomIdInput.value = getInitialRoomId();
 playerNameInput.value = localStorage.getItem('ctf-player-name') || '';
+updateMapInfoLine();
 setCanvasAccent(null);
 
 async function boot() {
@@ -461,7 +518,7 @@ async function loadMap() {
 
   state.map = await response.json();
   state.mapName = state.map?.meta?.name || '-';
-  gameInfoLine1El.textContent = `Map: ${state.mapName}`;
+  updateMapInfoLine();
   updateLayoutMetrics();
   state.mapById.clear();
   state.obstacleColors.clear();
@@ -594,6 +651,15 @@ function setupEvents() {
   matchResultResetBtn.addEventListener('click', () => requestMatchReset());
 
   installAppBtn.addEventListener('click', installPwa);
+
+  roomIdInput.addEventListener('change', () => {
+    const roomId = getDesiredRoomId();
+    if (roomId) {
+      updateMapInfoLine();
+    }
+  });
+
+  roomIdInput.addEventListener('input', updateMapInfoLine);
 
   playerNameInput.addEventListener('change', () => {
     localStorage.setItem('ctf-player-name', playerNameInput.value.trim());
@@ -982,7 +1048,7 @@ function resetTransientInputs() {
 }
 
 function isTextInputFocused() {
-  return document.activeElement === playerNameInput;
+  return document.activeElement === playerNameInput || document.activeElement === roomIdInput;
 }
 
 function connect(options = {}) {
@@ -1004,8 +1070,16 @@ function connect(options = {}) {
     return;
   }
 
+  const roomId = getDesiredRoomId({ alertOnInvalid: true });
+  if (!roomId) {
+    state.desiredOnline = false;
+    return;
+  }
+
   state.connectAttempts += 1;
-  const socket = new WebSocket(WS_URL);
+  state.currentRoomId = roomId;
+  updateMapInfoLine();
+  const socket = new WebSocket(buildWebSocketUrl(roomId));
   state.socket = socket;
   setConnectionStatus('connecting');
   updateConnectButton();
@@ -1038,6 +1112,13 @@ function connect(options = {}) {
     if (message.type === 'welcome') {
       state.myPlayerId = message.playerId;
       state.myTeam = message.team;
+      const serverRoomId = normalizeRoomId(message.roomId || state.currentRoomId);
+      if (isValidRoomId(serverRoomId)) {
+        state.currentRoomId = serverRoomId;
+        roomIdInput.value = serverRoomId;
+        localStorage.setItem(ROOM_ID_STORAGE_KEY, serverRoomId);
+        updateMapInfoLine();
+      }
       setCanvasAccent(message.team);
       return;
     }
@@ -1087,6 +1168,10 @@ function connect(options = {}) {
     state.myPlayerId = null;
     state.myTeam = null;
     setConnectionStatus('disconnected');
+    if (!shouldReconnect) {
+      state.currentRoomId = null;
+    }
+    updateMapInfoLine();
     updateConnectButton();
     stopPingLoop();
     stopStateWatchdog();
@@ -1338,7 +1423,9 @@ function setConnectionStatus(value) {
 function updateConnectButton() {
   const socket = state.socket;
   const isOnline = socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING);
+  const roomLocked = Boolean(isOnline || (state.desiredOnline && state.reconnectTimeoutId));
   connectToggleBtn.textContent = isOnline ? 'Disconnect' : 'Connect';
+  roomIdInput.disabled = roomLocked;
   resetGameBtn.disabled = !state.connected;
   matchResultResetBtn.disabled = !state.connected;
   updateHomeScreen();

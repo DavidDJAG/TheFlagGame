@@ -4,7 +4,7 @@ using System.Text.Json;
 
 namespace TheFlag.Server;
 
-public sealed class GameHost
+public sealed class GameRoom
 {
     private const float PlayerRadius = 14f;
     private const float ShotRange = 420f;
@@ -13,7 +13,8 @@ public sealed class GameHost
     private const float HitEffectLifetimeSeconds = 0.35f;
     private const int MaxIncomingMessageBytes = 16 * 1024;
     private const int MatchDurationSeconds = 5 * 60;
-    private const int MaxPlayers = 32;
+    public const int MaxPlayersPerRoom = 32;
+    private const int MaxPlayers = MaxPlayersPerRoom;
     private const int MaxMessagesPerRateLimitWindow = 200;
     private const int MinCanvasWidth = 600;
     private const int MinCanvasHeight = 400;
@@ -34,6 +35,7 @@ public sealed class GameHost
 
     private readonly ILogger _logger;
     private readonly string _mapPath;
+    private readonly Action<string>? _roomEmptyCallback;
     private readonly object _sync = new();
     private readonly JsonSerializerOptions _jsonOptions = new()
     {
@@ -51,6 +53,7 @@ public sealed class GameHost
     private sealed record ClientRegistration(string PlayerId, string Team, string MapName, ConnectedClient Client);
 
     private Task? _loopTask;
+    private int _stopRequested;
     private int _blueScore;
     private int _redScore;
     private DateTimeOffset _matchStartedAtUtc;
@@ -59,15 +62,18 @@ public sealed class GameHost
     private string? _winnerTeam;
     private string? _loserTeam;
 
-    public GameHost(string mapPath, ILogger logger)
+    public GameRoom(string roomId, string mapPath, ILogger logger, Action<string>? roomEmptyCallback = null)
     {
+        RoomId = roomId;
         _logger = logger;
         _mapPath = mapPath;
+        _roomEmptyCallback = roomEmptyCallback;
         Map = LoadMapFromFile(mapPath);
         RawMapJson = Map.RawJson;
         StartNewMatchClock(DateTimeOffset.UtcNow);
     }
 
+    public string RoomId { get; }
     public int TickRate => 20;
     public int MaxPlayerCount => MaxPlayers;
     public int PlayerCount
@@ -78,6 +84,63 @@ public sealed class GameHost
             {
                 return _players.Count;
             }
+        }
+    }
+
+    public int ClientCount
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _clients.Count;
+            }
+        }
+    }
+
+    public bool IsEmpty
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _players.Count == 0 && _clients.Count == 0;
+            }
+        }
+    }
+
+    public string MapName
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return Map.Source.Meta.Name;
+            }
+        }
+    }
+
+    public string MatchStatus
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _matchFinished ? "finished" : "running";
+            }
+        }
+    }
+
+    public RoomSummary GetSummary()
+    {
+        lock (_sync)
+        {
+            return new RoomSummary(
+                RoomId,
+                _players.Count,
+                MaxPlayers,
+                Map.Source.Meta.Name,
+                _matchFinished ? "finished" : "running");
         }
     }
 
@@ -131,7 +194,7 @@ public sealed class GameHost
             return new MapReplaceResult(false, 500, "The map could not be saved to disk.");
         }
 
-        _logger.LogInformation("Map replaced successfully: {MapName}", nextMap.Source.Meta.Name);
+        _logger.LogInformation("Map replaced successfully for room {RoomId}: {MapName}", RoomId, nextMap.Source.Meta.Name);
         return new MapReplaceResult(true, 200, "Map updated successfully on the server.", nextMap.Source.Meta.Name, nextMap.Source.Objects.Count);
     }
 
@@ -146,11 +209,16 @@ public sealed class GameHost
         }
 
         _loopTask = Task.Run(GameLoopAsync);
-        _logger.LogInformation("Game loop started.");
+        _logger.LogInformation("Game loop started for room {RoomId}.", RoomId);
     }
 
-    public void Stop()
+    public void Stop(bool waitForLoop = true)
     {
+        if (Interlocked.Exchange(ref _stopRequested, 1) != 0)
+        {
+            return;
+        }
+
         _cts.Cancel();
 
         List<ConnectedClient> clients;
@@ -171,13 +239,16 @@ public sealed class GameHost
             }
         }
 
-        try
+        if (waitForLoop && _loopTask is not null && Task.CurrentId != _loopTask.Id)
         {
-            _loopTask?.Wait(TimeSpan.FromSeconds(2));
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "The game loop did not stop cleanly.");
+            try
+            {
+                _loopTask.Wait(TimeSpan.FromSeconds(2));
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "The game loop for room {RoomId} did not stop cleanly.", RoomId);
+            }
         }
     }
 
@@ -192,7 +263,7 @@ public sealed class GameHost
         if (serverWasAlreadyFull)
         {
             context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
-            await context.Response.WriteAsync("The game server is full.");
+            await context.Response.WriteAsync("The room is full.");
             return;
         }
 
@@ -201,8 +272,8 @@ public sealed class GameHost
         var registration = TryAddClient(socket);
         if (registration is null)
         {
-            _logger.LogWarning("Rejected WebSocket client because the server already has {MaxPlayers} players.", MaxPlayers);
-            await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "server full", CancellationToken.None);
+            _logger.LogWarning("Room {RoomId} is full. Rejected WebSocket client because the room already has {MaxPlayers} players.", RoomId, MaxPlayers);
+            await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "room full", CancellationToken.None);
             return;
         }
 
@@ -212,11 +283,12 @@ public sealed class GameHost
         var client = registration.Client;
 
         client.WriterTask = Task.Run(() => ClientWriterLoopAsync(client));
-        _logger.LogInformation("Client connected {PlayerId} ({Team})", playerId, team);
+        _logger.LogInformation("Client connected {PlayerId} in room {RoomId} ({Team})", playerId, RoomId, team);
 
         if (!TryQueueJson(client, new
         {
             type = "welcome",
+            roomId = RoomId,
             playerId,
             team,
             tickRate = TickRate,
@@ -247,7 +319,7 @@ public sealed class GameHost
                 {
                     closeStatus = WebSocketCloseStatus.PolicyViolation;
                     closeDescription = "rate limit exceeded";
-                    _logger.LogWarning("Rate limit exceeded by {PlayerId}. Closing connection.", playerId);
+                    _logger.LogWarning("Rate limit exceeded by {PlayerId} in room {RoomId}. Closing connection.", playerId, RoomId);
                     break;
                 }
 
@@ -341,6 +413,7 @@ public sealed class GameHost
             {
                 PlayerId = playerId,
                 Socket = socket,
+                RoomId = RoomId,
                 LastReceivedAtUtc = now,
                 RateLimitWindowStartedAtUtc = now
             };
@@ -447,7 +520,7 @@ public sealed class GameHost
                     if (elapsed >= MinimumResetElapsedTime)
                     {
                         ResetMatch();
-                        _logger.LogInformation("Match reset requested by {PlayerId}", playerId);
+                        _logger.LogInformation("Match reset requested by {PlayerId} in room {RoomId}", playerId, RoomId);
                     }
                     else
                     {
@@ -611,7 +684,7 @@ public sealed class GameHost
             }
         }
 
-        _logger.LogInformation("Game loop stopped.");
+        _logger.LogInformation("Game loop stopped for room {RoomId}.", RoomId);
     }
 
     private void Simulate(float dt)
@@ -774,7 +847,8 @@ public sealed class GameHost
         }
 
         _logger.LogInformation(
-            "Match finished. Blue {BlueScore} - Red {RedScore}. Winner: {WinnerTeam}",
+            "Match finished in room {RoomId}. Blue {BlueScore} - Red {RedScore}. Winner: {WinnerTeam}",
+            RoomId,
             _blueScore,
             _redScore,
             _winnerTeam);
@@ -1256,6 +1330,7 @@ public sealed class GameHost
         var dto = new
         {
             type = "state",
+            roomId = RoomId,
             serverTime = now.ToUnixTimeMilliseconds(),
             scores = new { blue = _blueScore, red = _redScore },
             match = new
@@ -1419,6 +1494,7 @@ public sealed class GameHost
     {
         ConnectedClient? client = null;
         PlayerRuntime? removedPlayer = null;
+        bool roomIsEmpty;
 
         lock (_sync)
         {
@@ -1431,6 +1507,8 @@ public sealed class GameHost
                     flag.ResetToBase();
                 }
             }
+
+            roomIsEmpty = _players.Count == 0 && _clients.Count == 0;
         }
 
         if (client is not null)
@@ -1441,13 +1519,18 @@ public sealed class GameHost
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Could not stop WebSocket client resources for {PlayerId}.", playerId);
+                _logger.LogWarning(ex, "Could not stop WebSocket client resources for {PlayerId} in room {RoomId}.", playerId, RoomId);
             }
         }
 
         if (client is not null || removedPlayer is not null)
         {
-            _logger.LogInformation("Client removed {PlayerId}", playerId);
+            _logger.LogInformation("Client removed {PlayerId} from room {RoomId}", playerId, RoomId);
+        }
+
+        if (roomIsEmpty && (client is not null || removedPlayer is not null))
+        {
+            _roomEmptyCallback?.Invoke(RoomId);
         }
     }
 
@@ -1651,13 +1734,13 @@ public sealed class GameHost
         return fallback;
     }
 
-    private static GameMap LoadMapFromFile(string mapPath)
+    public static GameMap LoadMapFromFile(string mapPath)
     {
         var rawJson = File.ReadAllText(mapPath);
         return LoadMapFromJson(rawJson);
     }
 
-    private static GameMap LoadMapFromJson(string rawJson)
+    public static GameMap LoadMapFromJson(string rawJson)
     {
         var source = JsonSerializer.Deserialize<MapDocument>(rawJson, new JsonSerializerOptions
         {

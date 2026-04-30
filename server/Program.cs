@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text;
+using System.Text.Json;
 using TheFlag.Server;
 using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Logging;
@@ -28,8 +29,8 @@ builder.Logging.AddProvider(new LocalFileLoggerProvider(
 builder.WebHost.UseUrls("http://0.0.0.0:5770");
 builder.Services.ConfigureHttpJsonOptions(options =>
 {
-    options.SerializerOptions.PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase;
-    options.SerializerOptions.DictionaryKeyPolicy = System.Text.Json.JsonNamingPolicy.CamelCase;
+    options.SerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
+    options.SerializerOptions.DictionaryKeyPolicy = JsonNamingPolicy.CamelCase;
     options.SerializerOptions.WriteIndented = false;
 });
 builder.Services.AddCors(options =>
@@ -84,21 +85,23 @@ app.UseWebSockets(new WebSocketOptions
 });
 
 var mapPath = Path.Combine(contentRoot, "Data", "map.json");
-var game = new GameHost(mapPath, app.Logger);
+var roomManager = new GameRoomManager(mapPath, app.Logger);
 
-app.Lifetime.ApplicationStarted.Register(game.Start);
-app.Lifetime.ApplicationStopping.Register(game.Stop);
+app.Lifetime.ApplicationStarted.Register(roomManager.Start);
+app.Lifetime.ApplicationStopping.Register(roomManager.Stop);
 
 app.MapGet("/health", () => Results.Ok(new
 {
     status = "ok",
-    players = game.PlayerCount,
-    maxPlayers = game.MaxPlayerCount,
-    tickRate = game.TickRate,
+    activeRooms = roomManager.ActiveRooms,
+    maxActiveRooms = roomManager.MaxRooms,
+    players = roomManager.TotalPlayers,
+    maxPlayersPerRoom = roomManager.MaxPlayersPerRoom,
+    tickRate = roomManager.TickRate,
     map = Path.GetFileName(mapPath)
 }));
 
-app.MapGet("/api/map", () => Results.Text(game.GetRawMapJson(), "application/json"));
+app.MapGet("/api/map", () => Results.Text(roomManager.GetRawMapJson(), "application/json"));
 
 app.MapPut("/api/map", async (HttpRequest request) =>
 {
@@ -125,7 +128,7 @@ app.MapPut("/api/map", async (HttpRequest request) =>
         }, statusCode: StatusCodes.Status413PayloadTooLarge);
     }
 
-    var result = game.TryReplaceMap(rawJson);
+    var result = roomManager.TryReplaceMap(rawJson);
 
     if (!result.Success)
     {
@@ -143,6 +146,45 @@ app.MapPut("/api/map", async (HttpRequest request) =>
         mapName = result.MapName,
         objectCount = result.ObjectCount
     });
+});
+
+app.MapGet("/api/rooms", () => Results.Ok(roomManager.GetRoomsResponse()));
+
+app.MapPost("/api/rooms", async (HttpRequest request) =>
+{
+    CreateRoomRequest? createRoomRequest;
+    try
+    {
+        createRoomRequest = await JsonSerializer.DeserializeAsync<CreateRoomRequest>(
+            request.Body,
+            new JsonSerializerOptions { PropertyNameCaseInsensitive = true },
+            request.HttpContext.RequestAborted);
+    }
+    catch (JsonException)
+    {
+        return Results.Json(new
+        {
+            ok = false,
+            message = "Invalid JSON body."
+        }, statusCode: StatusCodes.Status400BadRequest);
+    }
+
+    var result = roomManager.TryCreateRoom(createRoomRequest?.RoomId);
+    if (!result.Success)
+    {
+        return Results.Json(new
+        {
+            ok = false,
+            message = result.Message
+        }, statusCode: result.StatusCode);
+    }
+
+    return Results.Json(new
+    {
+        ok = true,
+        roomId = result.RoomId,
+        message = result.Message
+    }, statusCode: result.StatusCode);
 });
 
 app.Map("/ws", async context =>
@@ -163,7 +205,7 @@ app.Map("/ws", async context =>
         return;
     }
 
-    await game.HandleClientAsync(context);
+    await roomManager.HandleClientAsync(context);
 });
 
 await app.RunAsync();

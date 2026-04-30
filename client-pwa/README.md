@@ -4,7 +4,7 @@ Playable frontend for **THE FLAG**. This folder contains the current game client
 
 ## Overview
 
-`client-pwa/` is the active frontend of the project. It connects to the authoritative backend over WebSocket, loads the map over HTTP, and renders the match on a 2D canvas.
+`client-pwa/` is the active frontend of the project. It connects to the authoritative backend over WebSocket, loads the base map over HTTP, and renders the match on a 2D canvas.
 
 There is no framework and no build pipeline. The frontend lives entirely in static files that can be served directly or opened in the browser.
 
@@ -13,6 +13,8 @@ There is no framework and no build pipeline. The frontend lives entirely in stat
 The app currently includes:
 
 - backend connection through WebSocket
+- room selection before connecting, with `public` as the default room
+- WebSocket room routing through `/ws?room=<roomId>`
 - map loading through `GET /api/map`
 - arena rendering in Canvas 2D
 - rendering for detailed 0.50x top-down player avatars, flags, shot traces, and hit effects
@@ -20,7 +22,7 @@ The app currently includes:
 - desktop and mobile controls
 - live ping measurement
 - connection watchdog and automatic reconnect when state snapshots stop arriving
-- match reset button usable at any time
+- match reset button usable at any time, scoped by the backend to the connected room
 - 5-minute countdown timer in the top HUD
 - final-result overlay with winner/loser/tie and scores
 - installable PWA support
@@ -48,21 +50,50 @@ client-pwa/
 On startup, the app:
 
 1. resolves backend configuration from the URL and current origin
-2. loads the map with `GET /api/map`
-3. initializes the UI, canvas, and event handlers
-4. tries to register the service worker
-5. waits for the player to connect
+2. resolves the initial room from `?room=`, local storage, or `public`
+3. loads the map with `GET /api/map`
+4. initializes the UI, canvas, and event handlers
+5. tries to register the service worker
+6. waits for the player to connect
 
 ### Match connection
 
 When the player clicks **Connect**:
 
-1. it opens a WebSocket to `/ws`
-2. it sends `hello` with the player name
-3. it starts sending `input`
-4. it receives `welcome`
-5. it processes `state` snapshots with players, scores, flags, shots, events, and match timer data
-6. it starts the watchdog that expects regular state snapshots from the backend
+1. it normalizes and validates the value in the **Room** field
+2. it opens a WebSocket to `/ws?room=<roomId>`
+3. it sends `hello` with the player name
+4. it starts sending `input`
+5. it receives `welcome`, including the server-confirmed `roomId`
+6. it processes `state` snapshots with players, scores, flags, shots, events, and match timer data
+7. it starts the watchdog that expects regular state snapshots from the backend
+
+### Room selection
+
+The side drawer now has a **Room** field above **Player name**.
+
+- The default value is `public`.
+- Empty values are normalized back to `public`.
+- Room IDs are trimmed and converted to lowercase before connecting.
+- The accepted format is `a-z`, `0-9`, `_`, and `-`, up to 32 characters.
+- The selected room is stored in local storage after a successful valid entry.
+- The room field is locked while the socket is connected, connecting, or reconnecting. Disconnect first to switch rooms.
+- The server-confirmed room from `welcome.roomId` is reflected back into the field.
+
+Examples:
+
+```text
+public
+alpha
+test-01
+team_blue
+```
+
+You can also preselect a room with the URL:
+
+```text
+http://127.0.0.1:5770/pwa/?room=alpha
+```
 
 ## Features
 
@@ -80,8 +111,18 @@ When the player clicks **Connect**:
 - real-time match state updates with visual interpolation for smoother player movement
 - doubled player footstep animation cadence without changing gameplay displacement speed
 - final-result overlay when the server marks the match as finished
-- **Reset Match** sends `resetGame`, which resets scores, flags, timer, teams, and positions on the backend
+- **Reset Match** sends `resetGame`, which resets scores, flags, timer, teams, and positions in the current backend room
 - local player team/accent updates when the backend reassigns teams after reset
+
+### Multi-room behavior
+
+The frontend joins exactly one backend room per WebSocket connection.
+
+- `/ws` remains compatible with the backend default room, but this client explicitly sends `/ws?room=<roomId>`.
+- Players in different rooms do not see or affect each other when the backend multi-room server is used.
+- Reset, scores, flags, shots, hits, timer, and match result are room-scoped by the backend.
+- The current map is still global and loaded through `GET /api/map`.
+- The client does not yet list rooms from `GET /api/rooms`; room names are entered manually.
 
 ### Visual effects
 
@@ -93,6 +134,7 @@ When the player clicks **Connect**:
 ### UI
 
 - slide-out side menu
+- room field above player name
 - connection status
 - live ping display
 - editable player name
@@ -101,6 +143,7 @@ When the player clicks **Connect**:
 - **Reset Match** button in the side menu
 - **Reset Match** button in the final-result overlay
 - timer changes style when the match is finished
+- map information line also shows the selected or connected room
 
 ### Responsive and mobile
 
@@ -114,7 +157,7 @@ When the player clicks **Connect**:
 
 The client tracks the time of the last `state` snapshot. If no state arrives for several seconds while the socket still appears open, the client closes the WebSocket and lets the normal reconnect flow create a new connection.
 
-This protects the UI from staying frozen forever if the network, proxy, or socket enters a half-open state.
+This protects the UI from staying frozen forever if the network, proxy, or socket enters a half-open state. Reconnect attempts keep using the selected room unless the player disconnects and changes it.
 
 ## Controls
 
@@ -143,23 +186,24 @@ http://127.0.0.1:5770
 
 ### Supported query parameters
 
-- `server` or `apiBase`
-- `basePath` or `publicPath`
+- `server` or `apiBase`: backend origin
+- `basePath` or `publicPath`: public path prefix when the backend is reverse-proxied
+- `room`: initial room shown in the Room field
 
 Examples:
 
 ```text
-file:///C:/path/client-pwa/index.html?server=http://127.0.0.1:5770
+file:///C:/path/client-pwa/index.html?server=http://127.0.0.1:5770&room=alpha
 ```
 
 ```text
-https://example.com/theflag/?server=https://example.com&basePath=/theflag
+https://example.com/theflag/?server=https://example.com&basePath=/theflag&room=test-01
 ```
 
 When published behind Nginx under `/theflag/`, the client can use:
 
 ```text
-https://server.mcrenox.com/theflag/
+https://server.mcrenox.com/theflag/?room=public
 ```
 
 and it will route API and WebSocket traffic through the same public prefix.
@@ -172,12 +216,12 @@ and it will route API and WebSocket traffic through the same public prefix.
 
 ### WebSocket
 
-- `WS /ws`
+- `WS /ws?room=<roomId>`
 
 When deployed under `/theflag/`, these effectively become:
 
 - `GET /theflag/api/map`
-- `WS /theflag/ws`
+- `WS /theflag/ws?room=<roomId>`
 
 ## Network messages
 
@@ -191,11 +235,18 @@ When deployed under `/theflag/`, these effectively become:
 { "type": "resetGame" }
 ```
 
+The room is not sent as a JSON message. It is selected through the WebSocket URL query string:
+
+```text
+/ws?room=alpha
+```
+
 ### Server -> client
 
 ```json
 {
   "type": "welcome",
+  "roomId": "alpha",
   "playerId": "p-123",
   "team": "blue",
   "tickRate": 20,
@@ -206,6 +257,7 @@ When deployed under `/theflag/`, these effectively become:
 ```json
 {
   "type": "state",
+  "roomId": "alpha",
   "serverTime": 1710000000000,
   "scores": { "blue": 0, "red": 0 },
   "match": {
@@ -246,7 +298,7 @@ The server controls the timer. The frontend only displays the `remainingMs` valu
   - loser team
   - tie state if applicable
   - final Blue/Red score
-  - reset button to start a new match
+  - reset button to start a new match in the current room
 
 ## PWA support
 
@@ -273,6 +325,8 @@ It does not cache:
 
 This keeps the static shell available offline while gameplay still depends on the live backend.
 
+The service worker cache version was bumped so browsers fetch the updated room-selection UI after deployment.
+
 ## How to test it
 
 ### Option 1: through the backend
@@ -283,7 +337,19 @@ If you run `server/`, the backend serves this app at:
 http://127.0.0.1:5770/pwa/
 ```
 
-This is the easiest way to test it.
+Open two browser tabs with the same room, for example:
+
+```text
+http://127.0.0.1:5770/pwa/?room=alpha
+```
+
+Both clients should see each other. Then open a third tab with another room:
+
+```text
+http://127.0.0.1:5770/pwa/?room=beta
+```
+
+The `beta` client should not see players, shots, flags, scores, or reset effects from `alpha`.
 
 ### Option 2: as a static site
 
@@ -313,6 +379,8 @@ The app uses the map JSON to:
 
 Spawn zones are not drawn from map JSON. They are computed by the backend and reflected through player positions in the live state snapshots.
 
+The map editor remains independent from room selection. It still works against the backend global map endpoints.
+
 ## Related folders
 
 - `editor/`: the project's map editor
@@ -322,7 +390,8 @@ Spawn zones are not drawn from map JSON. They are computed by the backend and re
 
 - no chat
 - no authentication
-- no room selection
+- no room list UI yet
+- no explicit room creation UI yet; rooms are created on demand by connecting to a valid room ID when the backend supports it
 - no player visual customization
 - no mouse aim independent from movement
 - no advanced interpolation
@@ -332,9 +401,11 @@ Spawn zones are not drawn from map JSON. They are computed by the backend and re
 
 1. Run the backend in `server/`
 2. Open `http://127.0.0.1:5770/pwa/`
-3. Connect one or more clients
-4. Play until the timer ends, or press **Reset Match** to restart immediately
-5. Optionally edit the map from `client-pwa/editor/`
+3. Enter a room or keep the default `public`
+4. Connect one or more clients to the same room
+5. Open another client in a different room to verify isolation
+6. Play until the timer ends, or press **Reset Match** to restart the current room immediately
+7. Optionally edit the map from `client-pwa/editor/` when no players are connected in any active room
 
 ## Author
 

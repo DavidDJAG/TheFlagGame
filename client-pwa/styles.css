@@ -466,6 +466,10 @@ canvas {
   gap: 8px;
 }
 
+.field + .field {
+  margin-top: 12px;
+}
+
 .field span {
   font-size: 14px;
   color: var(--text);
@@ -483,6 +487,11 @@ canvas {
 
 .field input::placeholder {
   color: #7f8aad;
+}
+
+.field input:disabled {
+  opacity: 0.72;
+  cursor: default;
 }
 
 .panel-status-grid {
