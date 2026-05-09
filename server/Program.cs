@@ -85,7 +85,24 @@ app.UseWebSockets(new WebSocketOptions
 });
 
 var mapPath = Path.Combine(contentRoot, "Data", "map.json");
-var roomManager = new GameRoomManager(mapPath, app.Logger);
+const string RuntimeSettingsFileName = "server-runtime.json";
+var runtimeSettingsPath = Path.Combine(AppContext.BaseDirectory, RuntimeSettingsFileName);
+var runtimeOptions = LoadRuntimeOptions(runtimeSettingsPath, app.Logger);
+app.Logger.LogInformation(
+    "Runtime options loaded from {RuntimeSettingsPath}: training={TrainingMode}, tickRate={TickRate}, timeScale={TimeScale}, runFast={RunFast}, maxSimulationStepSeconds={MaxSimulationStepSeconds}, maxSimulationSubstepsPerTick={MaxSimulationSubstepsPerTick}, matchDurationOverride={MatchDuration}, resetCooldownSeconds={ResetCooldown}, autoResetFinishedMatches={AutoResetFinishedMatches}, disableIdleTimeout={DisableIdleTimeout}, messageLimit={MessageLimit}",
+    runtimeSettingsPath,
+    runtimeOptions.TrainingMode,
+    runtimeOptions.TickRate,
+    runtimeOptions.TimeScale,
+    runtimeOptions.RunAsFastAsPossible,
+    runtimeOptions.MaxSimulationStepSeconds,
+    runtimeOptions.MaxSimulationSubstepsPerTick,
+    runtimeOptions.MatchDurationSecondsOverride,
+    runtimeOptions.ResetCooldownSeconds,
+    runtimeOptions.AutoResetFinishedMatches,
+    runtimeOptions.DisableClientIdleTimeout,
+    runtimeOptions.MaxMessagesPerRateLimitWindow);
+var roomManager = new GameRoomManager(mapPath, app.Logger, runtimeOptions);
 
 app.Lifetime.ApplicationStarted.Register(roomManager.Start);
 app.Lifetime.ApplicationStopping.Register(roomManager.Stop);
@@ -98,7 +115,21 @@ app.MapGet("/health", () => Results.Ok(new
     players = roomManager.TotalPlayers,
     maxPlayersPerRoom = roomManager.MaxPlayersPerRoom,
     tickRate = roomManager.TickRate,
-    map = Path.GetFileName(mapPath)
+    map = Path.GetFileName(mapPath),
+    training = new
+    {
+        enabled = runtimeOptions.TrainingMode,
+        timeScale = runtimeOptions.TimeScale,
+        runAsFastAsPossible = runtimeOptions.RunAsFastAsPossible,
+        maxSimulationStepSeconds = runtimeOptions.MaxSimulationStepSeconds,
+        maxSimulationSubstepsPerTick = runtimeOptions.MaxSimulationSubstepsPerTick,
+        matchDurationSecondsOverride = runtimeOptions.MatchDurationSecondsOverride,
+        resetCooldownSeconds = runtimeOptions.ResetCooldownSeconds,
+        autoResetFinishedMatches = runtimeOptions.AutoResetFinishedMatches,
+        disableClientIdleTimeout = runtimeOptions.DisableClientIdleTimeout,
+        maxMessagesPerRateLimitWindow = runtimeOptions.MaxMessagesPerRateLimitWindow,
+        runtimeSettingsFile = runtimeSettingsPath
+    }
 }));
 
 app.MapGet("/api/map", () => Results.Text(roomManager.GetRawMapJson(), "application/json"));
@@ -258,6 +289,64 @@ static bool IsLoopbackHost(string? host)
     }
 
     return IPAddress.TryParse(normalizedHost, out var ipAddress) && IPAddress.IsLoopback(ipAddress);
+}
+
+
+static ServerRuntimeOptions LoadRuntimeOptions(string settingsPath, ILogger logger)
+{
+    var jsonOptions = new JsonSerializerOptions
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        WriteIndented = true,
+        PropertyNameCaseInsensitive = true
+    };
+
+    if (!File.Exists(settingsPath))
+    {
+        logger.LogWarning(
+            "Runtime settings file was not found at {RuntimeSettingsPath}. Using production runtime options with trainingMode=false.",
+            settingsPath);
+        return ServerRuntimeOptions.Production;
+    }
+
+    try
+    {
+        using var stream = File.OpenRead(settingsPath);
+        var loaded = JsonSerializer.Deserialize<ServerRuntimeOptions>(stream, jsonOptions)
+            ?? throw new InvalidOperationException($"Runtime settings file '{settingsPath}' is empty or invalid.");
+
+        return NormalizeRuntimeOptions(loaded, logger, settingsPath);
+    }
+    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException)
+    {
+        throw new InvalidOperationException($"Could not load runtime settings from '{settingsPath}'. Fix or delete that JSON file and restart the server.", ex);
+    }
+}
+
+static ServerRuntimeOptions NormalizeRuntimeOptions(ServerRuntimeOptions options, ILogger logger, string settingsPath)
+{
+    if (!options.TrainingMode)
+    {
+        logger.LogInformation(
+            "Runtime settings file {RuntimeSettingsPath} has trainingMode=false. Ignoring training-oriented JSON values and using production runtime options.",
+            settingsPath);
+        return ServerRuntimeOptions.Production;
+    }
+
+    return new ServerRuntimeOptions
+    {
+        TrainingMode = true,
+        TickRate = Math.Clamp(options.TickRate, 1, 1000),
+        TimeScale = Math.Clamp(options.TimeScale, 0.001f, 1000f),
+        RunAsFastAsPossible = options.RunAsFastAsPossible,
+        MatchDurationSecondsOverride = options.MatchDurationSecondsOverride,
+        ResetCooldownSeconds = Math.Max(0, options.ResetCooldownSeconds),
+        AutoResetFinishedMatches = options.AutoResetFinishedMatches,
+        DisableClientIdleTimeout = options.DisableClientIdleTimeout,
+        MaxMessagesPerRateLimitWindow = Math.Max(0, options.MaxMessagesPerRateLimitWindow),
+        MaxSimulationStepSeconds = Math.Clamp(options.MaxSimulationStepSeconds <= 0f ? 1f / 120f : options.MaxSimulationStepSeconds, 1f / 1000f, 0.05f),
+        MaxSimulationSubstepsPerTick = Math.Clamp(options.MaxSimulationSubstepsPerTick <= 0 ? 64 : options.MaxSimulationSubstepsPerTick, 1, 512)
+    };
 }
 
 static async Task<string> ReadBodyWithLimitAsync(Stream body, long maxBytes, CancellationToken cancellationToken)

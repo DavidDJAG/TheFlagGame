@@ -4,6 +4,98 @@ using System.Threading.Channels;
 
 namespace TheFlag.Server;
 
+
+public sealed class ServerRuntimeOptions
+{
+    public bool TrainingMode { get; init; }
+    public int TickRate { get; init; } = 20;
+    public float TimeScale { get; init; } = 1f;
+    public bool RunAsFastAsPossible { get; init; }
+    public int? MatchDurationSecondsOverride { get; init; }
+    public int ResetCooldownSeconds { get; init; } = 60;
+    public bool AutoResetFinishedMatches { get; init; }
+    public bool DisableClientIdleTimeout { get; init; }
+    public int MaxMessagesPerRateLimitWindow { get; init; } = 200;
+    public float MaxSimulationStepSeconds { get; init; } = 1f / 60f;
+    public int MaxSimulationSubstepsPerTick { get; init; } = 3;
+
+    public static ServerRuntimeOptions Production { get; } = new()
+    {
+        TrainingMode = false,
+        TickRate = 20,
+        TimeScale = 1f,
+        RunAsFastAsPossible = false,
+        MatchDurationSecondsOverride = null,
+        ResetCooldownSeconds = 60,
+        AutoResetFinishedMatches = false,
+        DisableClientIdleTimeout = false,
+        MaxMessagesPerRateLimitWindow = 200,
+        MaxSimulationStepSeconds = 1f / 60f,
+        MaxSimulationSubstepsPerTick = 3
+    };
+}
+
+public sealed class PlayerStatsRuntime
+{
+    public required string PlayerId { get; init; }
+    public required string Name { get; set; }
+    public required string Team { get; set; }
+    public int ShotsFired { get; set; }
+    public int HitsDealt { get; set; }
+    public int HitsTaken { get; set; }
+    public int Eliminations { get; set; }
+    public int Deaths { get; set; }
+    public int FlagPickups { get; set; }
+    public int FlagDrops { get; set; }
+    public int FlagReturns { get; set; }
+    public int FlagCaptures { get; set; }
+    public float CarrySeconds { get; set; }
+    public float DistanceTravelled { get; set; }
+
+    public void ResetForMatch(string name, string team)
+    {
+        Name = name;
+        Team = team;
+        ShotsFired = 0;
+        HitsDealt = 0;
+        HitsTaken = 0;
+        Eliminations = 0;
+        Deaths = 0;
+        FlagPickups = 0;
+        FlagDrops = 0;
+        FlagReturns = 0;
+        FlagCaptures = 0;
+        CarrySeconds = 0f;
+        DistanceTravelled = 0f;
+    }
+}
+
+public sealed class GameEventRuntime
+{
+    public required string Id { get; init; }
+    public required long Sequence { get; init; }
+    public required string MatchId { get; init; }
+    public required string Type { get; init; }
+    public required long ServerTime { get; init; }
+    public string? PlayerId { get; init; }
+    public string? PlayerName { get; init; }
+    public string? Team { get; init; }
+    public string? ShooterPlayerId { get; init; }
+    public string? ShooterTeam { get; init; }
+    public string? VictimPlayerId { get; init; }
+    public string? VictimTeam { get; init; }
+    public string? FlagTeam { get; init; }
+    public string? WinnerTeam { get; init; }
+    public string? LoserTeam { get; init; }
+    public float? X { get; init; }
+    public float? Y { get; init; }
+    public float? ImpactX { get; init; }
+    public float? ImpactY { get; init; }
+    public float? Life { get; init; }
+    public int? BlueScore { get; init; }
+    public int? RedScore { get; init; }
+}
+
 public sealed class MapDocument
 {
     public MapMeta Meta { get; set; } = new();
@@ -155,6 +247,7 @@ public sealed class ConnectedClient
     public required string PlayerId { get; init; }
     public required string RoomId { get; init; }
     public required System.Net.WebSockets.WebSocket Socket { get; init; }
+    public bool IsSpectator { get; init; }
     public long? PendingPongNonce { get; set; }
     public DateTimeOffset LastReceivedAtUtc { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset RateLimitWindowStartedAtUtc { get; set; } = DateTimeOffset.UtcNow;

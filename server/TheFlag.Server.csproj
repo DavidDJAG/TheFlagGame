@@ -13,5 +13,9 @@
   </PropertyGroup>
   <ItemGroup>
     <Content Include="icon.ico" />
+    <None Update="server-runtime.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </None>
   </ItemGroup>
 </Project>

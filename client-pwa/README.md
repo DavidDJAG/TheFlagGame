@@ -14,7 +14,8 @@ The app currently includes:
 
 - backend connection through WebSocket
 - room selection before connecting, with `public` as the default room
-- WebSocket room routing through `/ws?room=<roomId>`
+- client connection options for requested team (`auto`, `blue`, `red`) and spectator mode
+- WebSocket room routing through `/ws?room=<roomId>`, optionally adding `team=<blue|red>` or `spectator=true`
 - map loading through `GET /api/map`
 - arena rendering in Canvas 2D
 - rendering for detailed 0.50x top-down player avatars, flags, shot traces, and hit effects
@@ -61,16 +62,17 @@ On startup, the app:
 When the player clicks **Connect**:
 
 1. it normalizes and validates the value in the **Room** field
-2. it opens a WebSocket to `/ws?room=<roomId>`
-3. it sends `hello` with the player name
-4. it starts sending `input`
-5. it receives `welcome`, including the server-confirmed `roomId`
-6. it processes `state` snapshots with players, scores, flags, shots, events, and match timer data
-7. it starts the watchdog that expects regular state snapshots from the backend
+2. it reads the selected team and spectator settings
+3. it opens a WebSocket to `/ws?room=<roomId>` plus only the needed connection settings
+4. for regular players, it sends `hello` with the player name and starts sending `input`
+5. for spectators, it does not send gameplay input and only observes server snapshots
+6. it receives `welcome`, including the server-confirmed `roomId`
+7. it processes `state` snapshots with players, scores, flags, shots, events, and match timer data
+8. it starts the watchdog that expects regular state snapshots from the backend
 
 ### Room selection
 
-The side drawer now has a **Room** field above **Player name**.
+The side drawer has **Room**, **Team**, **Spectator mode**, and **Player name** fields.
 
 - The default value is `public`.
 - Empty values are normalized back to `public`.
@@ -93,6 +95,41 @@ You can also preselect a room with the URL:
 
 ```text
 http://127.0.0.1:5770/pwa/?room=alpha
+```
+
+### Team selection and spectator mode
+
+The side drawer includes a **Team** selector and a **Spectator mode** checkbox.
+
+Team values:
+
+- `Auto`: preserves backend auto-assignment and does not send a `team` query parameter.
+- `Blue`: connects with `team=blue`.
+- `Red`: connects with `team=red`.
+
+Spectator mode:
+
+- unchecked: no `spectator` query parameter is sent.
+- checked: connects with `spectator=true`.
+- when spectator mode is enabled, the team selector is disabled and no gameplay inputs are sent.
+
+The selected team and spectator mode are stored in local storage for convenience. They can also be preselected through the frontend URL:
+
+```text
+http://127.0.0.1:5770/pwa/?room=alpha&team=red
+```
+
+```text
+http://127.0.0.1:5770/pwa/?room=alpha&spectator=true
+```
+
+Generated WebSocket examples:
+
+```text
+/ws?room=alpha
+/ws?room=alpha&team=blue
+/ws?room=alpha&team=red
+/ws?room=alpha&spectator=true
 ```
 
 ## Features
@@ -134,7 +171,7 @@ The frontend joins exactly one backend room per WebSocket connection.
 ### UI
 
 - slide-out side menu
-- room field above player name
+- room field, team selector, spectator-mode checkbox, and player name field
 - connection status
 - live ping display
 - editable player name
@@ -189,6 +226,8 @@ http://127.0.0.1:5770
 - `server` or `apiBase`: backend origin
 - `basePath` or `publicPath`: public path prefix when the backend is reverse-proxied
 - `room`: initial room shown in the Room field
+- `team`: initial team selector value; accepted values are `auto`, `blue`, and `red`
+- `spectator`: initial spectator-mode value; accepted true values include `true`, `1`, and `yes`
 
 Examples:
 
@@ -217,6 +256,8 @@ and it will route API and WebSocket traffic through the same public prefix.
 ### WebSocket
 
 - `WS /ws?room=<roomId>`
+- `WS /ws?room=<roomId>&team=<blue|red>`
+- `WS /ws?room=<roomId>&spectator=true`
 
 When deployed under `/theflag/`, these effectively become:
 
@@ -235,11 +276,16 @@ When deployed under `/theflag/`, these effectively become:
 { "type": "resetGame" }
 ```
 
-The room is not sent as a JSON message. It is selected through the WebSocket URL query string:
+The room, requested team, and spectator mode are not sent as JSON messages. They are selected through the WebSocket URL query string:
 
 ```text
 /ws?room=alpha
+/ws?room=alpha&team=blue
+/ws?room=alpha&team=red
+/ws?room=alpha&spectator=true
 ```
+
+When the selector is `Auto`, no `team` parameter is sent. When spectator mode is unchecked, no `spectator` parameter is sent.
 
 ### Server -> client
 
@@ -249,6 +295,7 @@ The room is not sent as a JSON message. It is selected through the WebSocket URL
   "roomId": "alpha",
   "playerId": "p-123",
   "team": "blue",
+  "spectator": false,
   "tickRate": 20,
   "mapName": "Blaze Field"
 }

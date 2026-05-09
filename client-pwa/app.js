@@ -6,6 +6,8 @@ const resetGameBtn = document.getElementById('resetGameBtn');
 const installAppBtn = document.getElementById('installAppBtn');
 const roomIdInput = document.getElementById('roomId');
 const playerNameInput = document.getElementById('playerName');
+const teamSelectionInput = document.getElementById('teamSelection');
+const spectatorModeInput = document.getElementById('spectatorMode');
 const connectionStatusEl = document.getElementById('connectionStatus');
 const gameInfoLine1El = document.getElementById('gameInfoLine1');
 const pingValueEl = document.getElementById('gameInfoLine4');
@@ -55,6 +57,8 @@ const RECONNECT_MAX_DELAY_MS = 5000;
 const MAX_CONNECT_ATTEMPTS = 5;
 const DEFAULT_ROOM_ID = 'public';
 const ROOM_ID_STORAGE_KEY = 'ctf-room-id';
+const TEAM_SELECTION_STORAGE_KEY = 'ctf-team-selection';
+const SPECTATOR_MODE_STORAGE_KEY = 'ctf-spectator-mode';
 const ROOM_ID_PATTERN = /^[a-z0-9_-]{1,32}$/;
 
 function normalizeBaseUrl(url) {
@@ -149,6 +153,72 @@ function getInitialRoomId() {
   return isValidRoomId(roomId) ? roomId : DEFAULT_ROOM_ID;
 }
 
+function normalizeTeamSelection(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return normalized === 'blue' || normalized === 'red' ? normalized : 'auto';
+}
+
+function parseBooleanSetting(value, defaultValue = false) {
+  if (value === null || typeof value === 'undefined') {
+    return defaultValue;
+  }
+
+  const normalized = String(value).trim().toLowerCase();
+  if (!normalized) {
+    return defaultValue;
+  }
+
+  if (normalized === 'true' || normalized === '1' || normalized === 'yes') {
+    return true;
+  }
+
+  if (normalized === 'false' || normalized === '0' || normalized === 'no') {
+    return false;
+  }
+
+  return defaultValue;
+}
+
+function getInitialTeamSelection() {
+  const params = new URLSearchParams(window.location.search);
+  const fromQuery = params.get('team');
+  const fromStorage = localStorage.getItem(TEAM_SELECTION_STORAGE_KEY);
+  return normalizeTeamSelection(fromQuery || fromStorage || 'auto');
+}
+
+function getInitialSpectatorMode() {
+  const params = new URLSearchParams(window.location.search);
+  const fromQuery = params.get('spectator');
+  if (fromQuery !== null) {
+    return parseBooleanSetting(fromQuery, false);
+  }
+  return parseBooleanSetting(localStorage.getItem(SPECTATOR_MODE_STORAGE_KEY), false);
+}
+
+function getDesiredTeamSelection() {
+  const teamSelection = normalizeTeamSelection(teamSelectionInput.value);
+  teamSelectionInput.value = teamSelection;
+  localStorage.setItem(TEAM_SELECTION_STORAGE_KEY, teamSelection);
+  return teamSelection;
+}
+
+function getDesiredSpectatorMode() {
+  const spectatorMode = Boolean(spectatorModeInput.checked);
+  localStorage.setItem(SPECTATOR_MODE_STORAGE_KEY, spectatorMode ? 'true' : 'false');
+  return spectatorMode;
+}
+
+function syncSpectatorModeUi() {
+  const connectionLocked = teamSelectionInput.dataset.connectionLocked === 'true';
+  const desiredSpectatorMode = Boolean(spectatorModeInput.checked);
+  const activeSpectatorMode = connectionLocked
+    ? desiredSpectatorMode || Boolean(state?.spectatorMode)
+    : desiredSpectatorMode;
+
+  teamSelectionInput.disabled = connectionLocked || activeSpectatorMode;
+  document.body.classList.toggle('spectator-mode', activeSpectatorMode);
+}
+
 function getDesiredRoomId({ alertOnInvalid = false } = {}) {
   const roomId = normalizeRoomId(roomIdInput.value);
   roomIdInput.value = roomId;
@@ -167,9 +237,16 @@ function getDesiredRoomId({ alertOnInvalid = false } = {}) {
   return roomId;
 }
 
-function buildWebSocketUrl(roomId) {
+function buildWebSocketUrl(roomId, { teamSelection = 'auto', spectatorMode = false } = {}) {
   const url = new URL(WS_URL);
   url.searchParams.set('room', roomId);
+
+  if (spectatorMode) {
+    url.searchParams.set('spectator', 'true');
+  } else if (teamSelection === 'blue' || teamSelection === 'red') {
+    url.searchParams.set('team', teamSelection);
+  }
+
   return url.toString();
 }
 
@@ -225,6 +302,8 @@ const state = {
   reconnectTimeoutId: null,
   lastStateReceivedAt: null,
   desiredOnline: false,
+  spectatorMode: false,
+  teamSelection: 'auto',
   connectAttempts: 0,
   reconnectAttempts: 0,
   mobile: {
@@ -491,7 +570,10 @@ function setCanvasAccent(team) {
 }
 
 roomIdInput.value = getInitialRoomId();
+teamSelectionInput.value = getInitialTeamSelection();
+spectatorModeInput.checked = getInitialSpectatorMode();
 playerNameInput.value = localStorage.getItem('ctf-player-name') || '';
+syncSpectatorModeUi();
 updateMapInfoLine();
 setCanvasAccent(null);
 
@@ -661,9 +743,25 @@ function setupEvents() {
 
   roomIdInput.addEventListener('input', updateMapInfoLine);
 
+  teamSelectionInput.addEventListener('change', () => {
+    getDesiredTeamSelection();
+    syncSpectatorModeUi();
+  });
+
+  spectatorModeInput.addEventListener('change', () => {
+    const desiredSpectatorMode = getDesiredSpectatorMode();
+    if (!state.connected && !state.desiredOnline) {
+      state.spectatorMode = desiredSpectatorMode;
+    }
+    syncSpectatorModeUi();
+    updateHomeScreen();
+  });
+
   playerNameInput.addEventListener('change', () => {
     localStorage.setItem('ctf-player-name', playerNameInput.value.trim());
-    send({ type: 'hello', name: playerNameInput.value.trim() || 'Player' });
+    if (!state.spectatorMode) {
+      send({ type: 'hello', name: playerNameInput.value.trim() || 'Player' });
+    }
   });
 
   const mapKey = (code, pressed) => {
@@ -1048,7 +1146,7 @@ function resetTransientInputs() {
 }
 
 function isTextInputFocused() {
-  return document.activeElement === playerNameInput || document.activeElement === roomIdInput;
+  return document.activeElement === playerNameInput || document.activeElement === roomIdInput || document.activeElement === teamSelectionInput;
 }
 
 function connect(options = {}) {
@@ -1076,10 +1174,15 @@ function connect(options = {}) {
     return;
   }
 
+  const teamSelection = getDesiredTeamSelection();
+  const spectatorMode = getDesiredSpectatorMode();
+
   state.connectAttempts += 1;
   state.currentRoomId = roomId;
+  state.teamSelection = teamSelection;
+  state.spectatorMode = spectatorMode;
   updateMapInfoLine();
-  const socket = new WebSocket(buildWebSocketUrl(roomId));
+  const socket = new WebSocket(buildWebSocketUrl(roomId, { teamSelection, spectatorMode }));
   state.socket = socket;
   setConnectionStatus('connecting');
   updateConnectButton();
@@ -1094,7 +1197,9 @@ function connect(options = {}) {
     setConnectionStatus('connected');
     updateConnectButton();
     closeMenu();
-    send({ type: 'hello', name: playerNameInput.value.trim() || 'Player' });
+    if (!state.spectatorMode) {
+      send({ type: 'hello', name: playerNameInput.value.trim() || 'Player' });
+    }
     schedulePingLoop();
     scheduleStateWatchdog();
     sendPing();
@@ -1110,8 +1215,9 @@ function connect(options = {}) {
       return;
     }
     if (message.type === 'welcome') {
-      state.myPlayerId = message.playerId;
-      state.myTeam = message.team;
+      state.spectatorMode = Boolean(message.spectator) || state.spectatorMode;
+      state.myPlayerId = state.spectatorMode ? null : message.playerId;
+      state.myTeam = state.spectatorMode ? null : message.team;
       const serverRoomId = normalizeRoomId(message.roomId || state.currentRoomId);
       if (isValidRoomId(serverRoomId)) {
         state.currentRoomId = serverRoomId;
@@ -1119,7 +1225,7 @@ function connect(options = {}) {
         localStorage.setItem(ROOM_ID_STORAGE_KEY, serverRoomId);
         updateMapInfoLine();
       }
-      setCanvasAccent(message.team);
+      setCanvasAccent(state.spectatorMode ? null : message.team);
       return;
     }
 
@@ -1170,6 +1276,7 @@ function connect(options = {}) {
     setConnectionStatus('disconnected');
     if (!shouldReconnect) {
       state.currentRoomId = null;
+      state.spectatorMode = Boolean(spectatorModeInput.checked);
     }
     updateMapInfoLine();
     updateConnectButton();
@@ -1301,7 +1408,7 @@ function checkStateWatchdog() {
 }
 
 function shoot() {
-  if (state.match.status === 'finished') {
+  if (state.spectatorMode || state.match.status === 'finished') {
     return;
   }
 
@@ -1316,7 +1423,7 @@ function send(payload) {
 }
 
 function sendCurrentInput() {
-  if (state.match.status === 'finished') {
+  if (state.spectatorMode || state.match.status === 'finished') {
     return;
   }
 
@@ -1426,8 +1533,11 @@ function updateConnectButton() {
   const roomLocked = Boolean(isOnline || (state.desiredOnline && state.reconnectTimeoutId));
   connectToggleBtn.textContent = isOnline ? 'Disconnect' : 'Connect';
   roomIdInput.disabled = roomLocked;
-  resetGameBtn.disabled = !state.connected;
-  matchResultResetBtn.disabled = !state.connected;
+  teamSelectionInput.dataset.connectionLocked = roomLocked ? 'true' : 'false';
+  spectatorModeInput.disabled = roomLocked;
+  syncSpectatorModeUi();
+  resetGameBtn.disabled = !state.connected || state.spectatorMode;
+  matchResultResetBtn.disabled = !state.connected || state.spectatorMode;
   updateHomeScreen();
 }
 
@@ -1452,9 +1562,10 @@ function getHomeMessage() {
     return 'Connection error. Open the menu and press Connect to try again';
   }
 
+  const verb = spectatorModeInput.checked ? 'watch' : 'join';
   return state.mobile.enabled
-    ? 'Open the menu and tap Connect to join'
-    : 'Open the menu and press Connect to join';
+    ? `Open the menu and tap Connect to ${verb}`
+    : `Open the menu and press Connect to ${verb}`;
 }
 
 function updateHomeScreen() {

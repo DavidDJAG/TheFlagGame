@@ -39,12 +39,14 @@ body {
 
 button,
 input,
+select,
 canvas {
   font: inherit;
 }
 
 button,
-input {
+input,
+select {
   -webkit-tap-highlight-color: transparent;
 }
 
@@ -376,6 +378,10 @@ canvas {
   display: block;
 }
 
+.spectator-mode .mobile-controls {
+  display: none;
+}
+
 .side-drawer {
   position: fixed;
   top: 0;
@@ -475,7 +481,8 @@ canvas {
   color: var(--text);
 }
 
-.field input {
+.field input,
+.field select {
   width: 100%;
   background: rgba(27, 37, 72, 0.76);
   border: 1px solid var(--line-strong);
@@ -489,9 +496,43 @@ canvas {
   color: #7f8aad;
 }
 
-.field input:disabled {
+.field input:disabled,
+.field select:disabled {
   opacity: 0.72;
   cursor: default;
+}
+
+.field select {
+  appearance: none;
+  background-image:
+    linear-gradient(45deg, transparent 50%, #9ca8c8 50%),
+    linear-gradient(135deg, #9ca8c8 50%, transparent 50%);
+  background-position:
+    calc(100% - 18px) 52%,
+    calc(100% - 12px) 52%;
+  background-size: 6px 6px, 6px 6px;
+  background-repeat: no-repeat;
+  padding-right: 38px;
+}
+
+.checkbox-field {
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(15, 25, 54, 0.46);
+}
+
+.checkbox-field input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--blue);
+}
+
+.checkbox-field span {
+  color: var(--text);
 }
 
 .panel-status-grid {

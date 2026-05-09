@@ -27,14 +27,22 @@ public sealed class GameRoom
     private const float MaxCoordinateMargin = 512f;
     private const float MinShapeSize = 1f;
     private const float MinPolygonArea = 4f;
+    private const float SpawnAnchorEdgeRatio = 0.075f;
+    private const float PreferredSpawnEdgeBandRatio = 0.24f;
+    private const float PreferredSpawnScatterVerticalRatio = 0.075f;
+    private const float MovementEpsilon = 0.001f;
+    private const float MovementCollisionContactTolerance = 0.75f;
+    private const float MovementSlideSkin = 0.5f;
+    private const float MovementSlideProbeMargin = 2f;
+    private const int MovementSlidePasses = 5;
+    private const int MovementSweepIterations = 12;
     private static readonly TimeSpan ClientSendTimeout = TimeSpan.FromSeconds(2);
-    private static readonly TimeSpan MatchDuration = TimeSpan.FromSeconds(MatchDurationSeconds);
-    private static readonly TimeSpan MinimumResetElapsedTime = TimeSpan.FromMinutes(1);
     private static readonly TimeSpan MaxClientIdleTime = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan RateLimitWindow = TimeSpan.FromSeconds(5);
 
     private readonly ILogger _logger;
     private readonly string _mapPath;
+    private readonly ServerRuntimeOptions _runtimeOptions;
     private readonly Action<string>? _roomEmptyCallback;
     private readonly object _sync = new();
     private readonly JsonSerializerOptions _jsonOptions = new()
@@ -47,10 +55,18 @@ public sealed class GameRoom
     private readonly Dictionary<string, ConnectedClient> _clients = [];
     private readonly List<ShotTraceRuntime> _shotTraces = [];
     private readonly List<HitEffectRuntime> _hitEffects = [];
+    private readonly Dictionary<string, PlayerStatsRuntime> _playerStats = [];
+    private readonly List<GameEventRuntime> _frameEvents = [];
     private readonly CancellationTokenSource _cts = new();
     private readonly Random _random = new();
 
-    private sealed record ClientRegistration(string PlayerId, string Team, string MapName, ConnectedClient Client);
+    private sealed record ClientRegistration(
+        string ConnectionId,
+        string? PlayerId,
+        string? Team,
+        string MapName,
+        ConnectedClient Client,
+        bool IsSpectator);
 
     private Task? _loopTask;
     private int _stopRequested;
@@ -59,22 +75,34 @@ public sealed class GameRoom
     private DateTimeOffset _matchStartedAtUtc;
     private DateTimeOffset _matchEndsAtUtc;
     private bool _matchFinished;
+    private DateTimeOffset? _matchFinishedAtUtc;
+    private bool _finishedStateBroadcasted;
     private string? _winnerTeam;
     private string? _loserTeam;
+    private string _matchId = CreateMatchId();
+    private long _stateSequence;
+    private long _eventSequence;
 
-    public GameRoom(string roomId, string mapPath, ILogger logger, Action<string>? roomEmptyCallback = null)
+    public GameRoom(
+        string roomId,
+        string mapPath,
+        ILogger logger,
+        Action<string>? roomEmptyCallback = null,
+        ServerRuntimeOptions? runtimeOptions = null)
     {
         RoomId = roomId;
         _logger = logger;
         _mapPath = mapPath;
         _roomEmptyCallback = roomEmptyCallback;
+        _runtimeOptions = runtimeOptions ?? ServerRuntimeOptions.Production;
         Map = LoadMapFromFile(mapPath);
         RawMapJson = Map.RawJson;
         StartNewMatchClock(DateTimeOffset.UtcNow);
     }
 
     public string RoomId { get; }
-    public int TickRate => 20;
+    public int TickRate => Math.Max(1, _runtimeOptions.TickRate);
+    private bool IsTrainingTelemetryEnabled => _runtimeOptions.TrainingMode;
     public int MaxPlayerCount => MaxPlayers;
     public int PlayerCount
     {
@@ -201,6 +229,10 @@ public sealed class GameRoom
     public string RawMapJson { get; private set; }
     public GameMap Map { get; private set; }
 
+    private TimeSpan CurrentMatchDuration => TimeSpan.FromSeconds(Math.Max(1, _runtimeOptions.MatchDurationSecondsOverride ?? MatchDurationSeconds));
+    private TimeSpan CurrentResetCooldown => TimeSpan.FromSeconds(Math.Max(0, _runtimeOptions.ResetCooldownSeconds));
+    private bool IsMatchClockDisabled => _runtimeOptions.MatchDurationSecondsOverride is <= 0;
+
     public void Start()
     {
         if (_loopTask is not null)
@@ -252,15 +284,18 @@ public sealed class GameRoom
         }
     }
 
-    public async Task HandleClientAsync(HttpContext context)
+    public async Task HandleClientAsync(HttpContext context, string requestedTeam, bool isSpectator)
     {
-        var serverWasAlreadyFull = false;
-        lock (_sync)
+        var roomWasAlreadyFull = false;
+        if (!isSpectator)
         {
-            serverWasAlreadyFull = _players.Count >= MaxPlayers;
+            lock (_sync)
+            {
+                roomWasAlreadyFull = _players.Count >= MaxPlayers;
+            }
         }
 
-        if (serverWasAlreadyFull)
+        if (roomWasAlreadyFull)
         {
             context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
             await context.Response.WriteAsync("The room is full.");
@@ -269,7 +304,7 @@ public sealed class GameRoom
 
         using var socket = await context.WebSockets.AcceptWebSocketAsync();
 
-        var registration = TryAddClient(socket);
+        var registration = TryAddClient(socket, requestedTeam, isSpectator);
         if (registration is null)
         {
             _logger.LogWarning("Room {RoomId} is full. Rejected WebSocket client because the room already has {MaxPlayers} players.", RoomId, MaxPlayers);
@@ -277,30 +312,57 @@ public sealed class GameRoom
             return;
         }
 
+        var connectionId = registration.ConnectionId;
         var playerId = registration.PlayerId;
         var team = registration.Team;
         var mapName = registration.MapName;
         var client = registration.Client;
+        var role = registration.IsSpectator ? "spectator" : "player";
 
         client.WriterTask = Task.Run(() => ClientWriterLoopAsync(client));
-        _logger.LogInformation("Client connected {PlayerId} in room {RoomId} ({Team})", playerId, RoomId, team);
+        _logger.LogInformation(
+            "Client connected {ConnectionId} in room {RoomId} as {Role} ({Team}, requested: {RequestedTeam})",
+            connectionId,
+            RoomId,
+            role,
+            team ?? "none",
+            requestedTeam);
 
         if (!TryQueueJson(client, new
         {
             type = "welcome",
             roomId = RoomId,
+            connectionId,
             playerId,
+            role,
+            spectator = registration.IsSpectator,
             team,
+            teamSelection = registration.IsSpectator
+                ? null
+                : new
+                {
+                    requested = requestedTeam,
+                    autoAssigned = requestedTeam == "auto"
+                },
             tickRate = TickRate,
-            mapName
+            mapName,
+            training = new
+            {
+                enabled = _runtimeOptions.TrainingMode,
+                timeScale = _runtimeOptions.TimeScale,
+                runAsFastAsPossible = _runtimeOptions.RunAsFastAsPossible,
+                maxSimulationStepSeconds = _runtimeOptions.MaxSimulationStepSeconds,
+                maxSimulationSubstepsPerTick = _runtimeOptions.MaxSimulationSubstepsPerTick,
+                matchClockDisabled = IsMatchClockDisabled
+            }
         }))
         {
-            _logger.LogWarning("Could not queue welcome message for {PlayerId}. Closing connection.", playerId);
-            RemoveClient(playerId, abortSocket: true);
+            _logger.LogWarning("Could not queue welcome message for {ConnectionId}. Closing connection.", connectionId);
+            RemoveClient(connectionId, abortSocket: true);
             return;
         }
 
-        SendStateTo(playerId);
+        SendStateTo(connectionId);
 
         var closeStatus = WebSocketCloseStatus.NormalClosure;
         var closeDescription = "bye";
@@ -315,48 +377,48 @@ public sealed class GameRoom
                     break;
                 }
 
-                if (!TryRegisterClientMessage(playerId))
+                if (!TryRegisterClientMessage(connectionId))
                 {
                     closeStatus = WebSocketCloseStatus.PolicyViolation;
                     closeDescription = "rate limit exceeded";
-                    _logger.LogWarning("Rate limit exceeded by {PlayerId} in room {RoomId}. Closing connection.", playerId, RoomId);
+                    _logger.LogWarning("Rate limit exceeded by {ConnectionId} in room {RoomId}. Closing connection.", connectionId, RoomId);
                     break;
                 }
 
-                HandleIncomingMessage(playerId, message);
+                HandleIncomingMessage(connectionId, message);
             }
         }
         catch (InvalidDataException ex)
         {
             closeStatus = WebSocketCloseStatus.MessageTooBig;
             closeDescription = "incoming message too large or invalid";
-            _logger.LogWarning(ex, "Rejected WebSocket message from {PlayerId}.", playerId);
+            _logger.LogWarning(ex, "Rejected WebSocket message from {ConnectionId}.", connectionId);
         }
         catch (OperationCanceledException) when (IsExpectedWebSocketStop(client, socket, context))
         {
-            _logger.LogInformation("WebSocket receive loop ended for {PlayerId}.", playerId);
+            _logger.LogInformation("WebSocket receive loop ended for {ConnectionId}.", connectionId);
         }
         catch (OperationCanceledException ex)
         {
-            _logger.LogWarning(ex, "Unexpected WebSocket receive cancellation for {PlayerId}.", playerId);
+            _logger.LogWarning(ex, "Unexpected WebSocket receive cancellation for {ConnectionId}.", connectionId);
         }
         catch (WebSocketException ex) when (IsExpectedWebSocketClose(ex, client, socket, context))
         {
-            _logger.LogInformation("WebSocket closed without clean handshake for {PlayerId}.", playerId);
+            _logger.LogInformation("WebSocket closed without clean handshake for {ConnectionId}.", connectionId);
         }
         catch (WebSocketException ex)
         {
-            _logger.LogWarning(ex, "WebSocket receive failed for {PlayerId}.", playerId);
+            _logger.LogWarning(ex, "WebSocket receive failed for {ConnectionId}.", connectionId);
         }
         catch (Exception ex)
         {
             closeStatus = WebSocketCloseStatus.InternalServerError;
             closeDescription = "server error";
-            _logger.LogError(ex, "Unexpected error while handling WebSocket client {PlayerId}.", playerId);
+            _logger.LogError(ex, "Unexpected error while handling WebSocket client {ConnectionId}.", connectionId);
         }
         finally
         {
-            RemoveClient(playerId, abortSocket: false);
+            RemoveClient(connectionId, abortSocket: false);
             if (socket.State == WebSocketState.Open || socket.State == WebSocketState.CloseReceived)
             {
                 try
@@ -365,62 +427,85 @@ public sealed class GameRoom
                 }
                 catch (OperationCanceledException) when (IsExpectedWebSocketStop(client, socket, context))
                 {
-                    _logger.LogInformation("WebSocket close handshake canceled for {PlayerId}.", playerId);
+                    _logger.LogInformation("WebSocket close handshake canceled for {ConnectionId}.", connectionId);
                 }
                 catch (WebSocketException ex) when (IsExpectedWebSocketClose(ex, client, socket, context))
                 {
-                    _logger.LogInformation("WebSocket close handshake was not completed for {PlayerId}.", playerId);
+                    _logger.LogInformation("WebSocket close handshake was not completed for {ConnectionId}.", connectionId);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "Could not close WebSocket cleanly for {PlayerId}.", playerId);
+                    _logger.LogWarning(ex, "Could not close WebSocket cleanly for {ConnectionId}.", connectionId);
                 }
             }
         }
     }
 
-    private ClientRegistration? TryAddClient(WebSocket socket)
+    private ClientRegistration? TryAddClient(WebSocket socket, string requestedTeam, bool isSpectator)
     {
         lock (_sync)
         {
-            if (_players.Count >= MaxPlayers)
+            if (!isSpectator && _players.Count >= MaxPlayers)
             {
                 return null;
             }
 
-            if (_players.Count == 0)
+            if (!isSpectator && _players.Count == 0)
             {
                 ResetMatch();
             }
 
-            var playerId = $"p-{Guid.NewGuid():N}";
-            var team = ChooseTeam();
-            var name = team == "blue" ? $"Blue-{_players.Count + 1}" : $"Red-{_players.Count + 1}";
-            var spawn = FindSpawn(team);
+            var connectionId = $"{(isSpectator ? "s" : "p")}-{Guid.NewGuid():N}";
+            string? playerId = null;
+            string? team = null;
 
-            _players[playerId] = new PlayerRuntime
+            if (!isSpectator)
             {
-                Id = playerId,
-                Name = name,
-                Team = team,
-                Position = spawn,
-                SpawnPosition = spawn,
-                Facing = team == "blue" ? new Vec2(1f, 0f) : new Vec2(-1f, 0f)
-            };
+                var assignedPlayerId = connectionId;
+                var assignedTeam = ChooseTeam(requestedTeam);
+                playerId = assignedPlayerId;
+                team = assignedTeam;
+                var name = assignedTeam == "blue" ? $"Blue-{_players.Count + 1}" : $"Red-{_players.Count + 1}";
+                var spawn = FindSpawn(assignedTeam);
+
+                var player = new PlayerRuntime
+                {
+                    Id = assignedPlayerId,
+                    Name = name,
+                    Team = assignedTeam,
+                    Position = spawn,
+                    SpawnPosition = spawn,
+                    Facing = assignedTeam == "blue" ? new Vec2(1f, 0f) : new Vec2(-1f, 0f)
+                };
+
+                _players[assignedPlayerId] = player;
+                if (IsTrainingTelemetryEnabled)
+                {
+                    _playerStats[assignedPlayerId] = new PlayerStatsRuntime
+                    {
+                        PlayerId = assignedPlayerId,
+                        Name = name,
+                        Team = assignedTeam
+                    };
+                }
+
+                EmitGameEvent("playerJoined", player: player, team: assignedTeam, x: spawn.X, y: spawn.Y);
+            }
 
             var now = DateTimeOffset.UtcNow;
             var client = new ConnectedClient
             {
-                PlayerId = playerId,
+                PlayerId = connectionId,
                 Socket = socket,
                 RoomId = RoomId,
+                IsSpectator = isSpectator,
                 LastReceivedAtUtc = now,
                 RateLimitWindowStartedAtUtc = now
             };
-            _clients[playerId] = client;
+            _clients[connectionId] = client;
 
             var mapName = Map.Source.Meta.Name;
-            return new ClientRegistration(playerId, team, mapName, client);
+            return new ClientRegistration(connectionId, playerId, team, mapName, client, isSpectator);
         }
     }
 
@@ -457,7 +542,7 @@ public sealed class GameRoom
         return Encoding.UTF8.GetString(ms.ToArray());
     }
 
-    private void HandleIncomingMessage(string playerId, string message)
+    private void HandleIncomingMessage(string connectionId, string message)
     {
         try
         {
@@ -470,7 +555,27 @@ public sealed class GameRoom
             var type = typeElement.GetString();
             lock (_sync)
             {
-                if (!_players.TryGetValue(playerId, out var player) || !_clients.TryGetValue(playerId, out var client))
+                if (!_clients.TryGetValue(connectionId, out var client))
+                {
+                    return;
+                }
+
+                if (type == "ping")
+                {
+                    if (doc.RootElement.TryGetProperty("nonce", out var nonceElement) && nonceElement.TryGetInt64(out var nonce))
+                    {
+                        client.PendingPongNonce = nonce;
+                    }
+
+                    return;
+                }
+
+                if (client.IsSpectator)
+                {
+                    return;
+                }
+
+                if (!_players.TryGetValue(connectionId, out var player))
                 {
                     return;
                 }
@@ -483,6 +588,10 @@ public sealed class GameRoom
                         if (!string.IsNullOrWhiteSpace(requestedName))
                         {
                             player.Name = requestedName.Length > 24 ? requestedName[..24] : requestedName;
+                            if (_playerStats.TryGetValue(player.Id, out var stats))
+                            {
+                                stats.Name = player.Name;
+                            }
                         }
                     }
                 }
@@ -506,28 +615,22 @@ public sealed class GameRoom
                         player.PendingShoot = true;
                     }
                 }
-                else if (type == "ping")
-                {
-                    if (doc.RootElement.TryGetProperty("nonce", out var nonceElement) && nonceElement.TryGetInt64(out var nonce))
-                    {
-                        client.PendingPongNonce = nonce;
-                    }
-                }
                 else if (type == "resetGame")
                 {
                     var now = DateTimeOffset.UtcNow;
                     var elapsed = GetMatchElapsedTime(now);
-                    if (elapsed >= MinimumResetElapsedTime)
+                    var resetCooldown = CurrentResetCooldown;
+                    if (elapsed >= resetCooldown)
                     {
                         ResetMatch();
-                        _logger.LogInformation("Match reset requested by {PlayerId} in room {RoomId}", playerId, RoomId);
+                        _logger.LogInformation("Match reset requested by {PlayerId} in room {RoomId}", connectionId, RoomId);
                     }
                     else
                     {
-                        var retryAfterMs = (long)Math.Ceiling((MinimumResetElapsedTime - elapsed).TotalMilliseconds);
+                        var retryAfterMs = (long)Math.Ceiling((resetCooldown - elapsed).TotalMilliseconds);
                         _logger.LogInformation(
                             "Match reset rejected for {PlayerId}. Reset is available in {RetryAfterMs} ms.",
-                            playerId,
+                            connectionId,
                             retryAfterMs);
 
                         TryQueueJson(client, new
@@ -542,12 +645,63 @@ public sealed class GameRoom
         }
         catch (JsonException ex)
         {
-            _logger.LogWarning(ex, "Invalid JSON received from {PlayerId}.", playerId);
+            _logger.LogWarning(ex, "Invalid JSON received from {ConnectionId}.", connectionId);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Unexpected error while processing a message from {PlayerId}.", playerId);
+            _logger.LogError(ex, "Unexpected error while processing a message from {ConnectionId}.", connectionId);
         }
+    }
+
+    public static bool TryReadTeamPreference(HttpContext context, out string requestedTeam, out string? error)
+    {
+        var rawTeam = context.Request.Query["team"].ToString();
+        if (string.IsNullOrWhiteSpace(rawTeam))
+        {
+            requestedTeam = "auto";
+            error = null;
+            return true;
+        }
+
+        requestedTeam = rawTeam.Trim().ToLowerInvariant();
+        if (requestedTeam is "auto" or "blue" or "red")
+        {
+            error = null;
+            return true;
+        }
+
+        error = "Invalid team preference. Use 'auto', 'blue', or 'red'.";
+        return false;
+    }
+
+    public static bool TryReadSpectatorMode(HttpContext context, out bool isSpectator, out string? error)
+    {
+        var rawSpectator = context.Request.Query["spectator"].ToString();
+        if (string.IsNullOrWhiteSpace(rawSpectator))
+        {
+            isSpectator = false;
+            error = null;
+            return true;
+        }
+
+        var normalizedSpectator = rawSpectator.Trim().ToLowerInvariant();
+        if (normalizedSpectator is "true" or "1" or "yes")
+        {
+            isSpectator = true;
+            error = null;
+            return true;
+        }
+
+        if (normalizedSpectator is "false" or "0" or "no")
+        {
+            isSpectator = false;
+            error = null;
+            return true;
+        }
+
+        isSpectator = false;
+        error = "Invalid spectator mode. Use 'true' or 'false'.";
+        return false;
     }
 
     private static bool ReadBool(JsonElement element, string propertyName)
@@ -574,7 +728,15 @@ public sealed class GameRoom
             }
 
             client.MessagesInCurrentWindow++;
-            return client.MessagesInCurrentWindow <= MaxMessagesPerRateLimitWindow;
+            if (_runtimeOptions.TrainingMode && _runtimeOptions.MaxMessagesPerRateLimitWindow <= 0)
+            {
+                return true;
+            }
+
+            var messageLimit = _runtimeOptions.MaxMessagesPerRateLimitWindow > 0
+                ? _runtimeOptions.MaxMessagesPerRateLimitWindow
+                : MaxMessagesPerRateLimitWindow;
+            return client.MessagesInCurrentWindow <= messageLimit;
         }
     }
 
@@ -598,15 +760,18 @@ public sealed class GameRoom
             try
             {
                 var now = DateTimeOffset.UtcNow;
-                var dt = (float)(now - last).TotalSeconds;
+                var dt = _runtimeOptions.RunAsFastAsPossible
+                    ? 1f / TickRate
+                    : (float)(now - last).TotalSeconds;
                 if (dt <= 0f)
                 {
                     dt = tickMs / 1000f;
                 }
-                if (dt > 0.1f)
+                if (!_runtimeOptions.RunAsFastAsPossible && dt > 0.1f)
                 {
                     dt = 0.1f;
                 }
+                dt *= MathF.Max(0.001f, _runtimeOptions.TimeScale);
                 last = now;
 
                 string payload;
@@ -614,8 +779,13 @@ public sealed class GameRoom
 
                 lock (_sync)
                 {
-                    Simulate(dt);
+                    SimulateWithSubsteps(dt);
                     payload = BuildStatePayload();
+                    if (_matchFinished)
+                    {
+                        _finishedStateBroadcasted = true;
+                    }
+                    _frameEvents.Clear();
                     clients = _clients.Values
                         .Select(c =>
                         {
@@ -637,7 +807,7 @@ public sealed class GameRoom
                         continue;
                     }
 
-                    if (now - client.LastReceivedAtUtc > MaxClientIdleTime)
+                    if (!client.IsSpectator && !_runtimeOptions.DisableClientIdleTimeout && now - client.LastReceivedAtUtc > MaxClientIdleTime)
                     {
                         _logger.LogInformation("Client {PlayerId} removed after more than {IdleSeconds} seconds without inbound messages.", client.PlayerId, MaxClientIdleTime.TotalSeconds);
                         deadClients.Add(client.PlayerId);
@@ -676,7 +846,14 @@ public sealed class GameRoom
 
             try
             {
-                await Task.Delay(tickMs, _cts.Token);
+                if (!_runtimeOptions.RunAsFastAsPossible)
+                {
+                    await Task.Delay(tickMs, _cts.Token);
+                }
+                else
+                {
+                    await Task.Yield();
+                }
             }
             catch (OperationCanceledException) when (_cts.IsCancellationRequested)
             {
@@ -687,25 +864,65 @@ public sealed class GameRoom
         _logger.LogInformation("Game loop stopped for room {RoomId}.", RoomId);
     }
 
+    private void SimulateWithSubsteps(float totalDt)
+    {
+        if (totalDt <= 0f)
+        {
+            return;
+        }
+
+        var maxStep = MathF.Max(0.001f, _runtimeOptions.MaxSimulationStepSeconds);
+        var maxSubsteps = Math.Max(1, _runtimeOptions.MaxSimulationSubstepsPerTick);
+        var clampedDt = MathF.Min(totalDt, maxStep * maxSubsteps);
+        var steps = Math.Max(1, (int)MathF.Ceiling(clampedDt / maxStep));
+        var stepDt = clampedDt / steps;
+
+        for (var i = 0; i < steps; i++)
+        {
+            Simulate(stepDt);
+        }
+    }
+
     private void Simulate(float dt)
     {
-        UpdateMatchClock(DateTimeOffset.UtcNow);
+        _stateSequence++;
+        var now = DateTimeOffset.UtcNow;
+        UpdateMatchClock(now);
 
         if (_matchFinished)
         {
-            foreach (var player in _players.Values)
+            if (ShouldAutoResetFinishedMatch(now))
             {
-                player.Input = new InputState();
-                player.PendingShoot = false;
+                ResetMatch();
             }
 
-            UpdateShotTraces(dt);
-            UpdateHitEffects(dt);
-            return;
+            if (_matchFinished)
+            {
+                foreach (var player in _players.Values)
+                {
+                    player.Input = new InputState();
+                    player.PendingShoot = false;
+                }
+
+                UpdateShotTraces(dt);
+                UpdateHitEffects(dt);
+                return;
+            }
         }
 
         foreach (var player in _players.Values)
         {
+            if (IsTrainingTelemetryEnabled)
+            {
+                var stats = GetOrCreateStats(player);
+                stats.Name = player.Name;
+                stats.Team = player.Team;
+                if (player.CarryingFlagTeam is not null)
+                {
+                    stats.CarrySeconds += dt;
+                }
+            }
+
             if (player.ShootCooldownRemaining > 0f)
             {
                 player.ShootCooldownRemaining = MathF.Max(0f, player.ShootCooldownRemaining - dt);
@@ -745,7 +962,13 @@ public sealed class GameRoom
             return;
         }
 
+        var previousPosition = player.Position;
         player.Position = MoveAgainstWorld(player.Position, delta, player.Radius);
+        var movedDistance = MathF.Sqrt(Geometry.DistanceSquared(previousPosition, player.Position));
+        if (movedDistance > 0.001f && IsTrainingTelemetryEnabled)
+        {
+            GetOrCreateStats(player).DistanceTravelled += movedDistance;
+        }
     }
 
     private void ResetMatch()
@@ -754,6 +977,7 @@ public sealed class GameRoom
         _redScore = 0;
         _shotTraces.Clear();
         _hitEffects.Clear();
+        _frameEvents.Clear();
         StartNewMatchClock(DateTimeOffset.UtcNow);
         ReassignPlayerTeams();
 
@@ -772,14 +996,22 @@ public sealed class GameRoom
             player.CarryingFlagTeam = null;
             player.ShootCooldownRemaining = 0f;
             player.PendingShoot = false;
+            GetOrCreateStats(player).ResetForMatch(player.Name, player.Team);
         }
+
+        EmitGameEvent("matchReset", blueScore: _blueScore, redScore: _redScore);
     }
 
     private void StartNewMatchClock(DateTimeOffset now)
     {
+        _matchId = CreateMatchId();
+        _eventSequence = 0;
+        _stateSequence = 0;
         _matchStartedAtUtc = now;
-        _matchEndsAtUtc = now.Add(MatchDuration);
+        _matchEndsAtUtc = now.Add(CurrentMatchDuration);
         _matchFinished = false;
+        _matchFinishedAtUtc = null;
+        _finishedStateBroadcasted = false;
         _winnerTeam = null;
         _loserTeam = null;
     }
@@ -806,6 +1038,11 @@ public sealed class GameRoom
 
     private void UpdateMatchClock(DateTimeOffset now)
     {
+        if (IsMatchClockDisabled)
+        {
+            return;
+        }
+
         if (_matchFinished || now < _matchEndsAtUtc)
         {
             return;
@@ -822,6 +1059,8 @@ public sealed class GameRoom
         }
 
         _matchFinished = true;
+        _matchFinishedAtUtc = DateTimeOffset.UtcNow;
+        _finishedStateBroadcasted = false;
 
         if (_blueScore > _redScore)
         {
@@ -846,6 +1085,8 @@ public sealed class GameRoom
             player.ShootCooldownRemaining = 0f;
         }
 
+        EmitGameEvent("matchFinished", winnerTeam: _winnerTeam, loserTeam: _loserTeam, blueScore: _blueScore, redScore: _redScore);
+
         _logger.LogInformation(
             "Match finished in room {RoomId}. Blue {BlueScore} - Red {RedScore}. Winner: {WinnerTeam}",
             RoomId,
@@ -854,8 +1095,29 @@ public sealed class GameRoom
             _winnerTeam);
     }
 
+
+    private bool ShouldAutoResetFinishedMatch(DateTimeOffset now)
+    {
+        if (!_runtimeOptions.AutoResetFinishedMatches || !_matchFinished || !_finishedStateBroadcasted)
+        {
+            return false;
+        }
+
+        if (_matchFinishedAtUtc is not { } finishedAt)
+        {
+            return false;
+        }
+
+        return now - finishedAt >= CurrentResetCooldown;
+    }
+
     private long GetMatchRemainingMilliseconds(DateTimeOffset now)
     {
+        if (IsMatchClockDisabled)
+        {
+            return -1;
+        }
+
         if (_matchFinished)
         {
             return 0;
@@ -1000,20 +1262,28 @@ public sealed class GameRoom
             RemainingLifetime = ShotTraceLifetimeSeconds
         });
 
+        GetOrCreateStats(shooter).ShotsFired++;
+        EmitGameEvent("shotFired", player: shooter, team: shooter.Team, x: start.X, y: start.Y);
+
         shooter.ShootCooldownRemaining = ShotCooldownSeconds;
 
         if (hit is not null)
         {
+            GetOrCreateStats(shooter).HitsDealt++;
+            GetOrCreateStats(shooter).Eliminations++;
+            GetOrCreateStats(hit.Player).HitsTaken++;
+            GetOrCreateStats(hit.Player).Deaths++;
             RegisterHitEffect(shooter, hit.Player, end);
-            EliminatePlayer(hit.Player);
+            EliminatePlayer(hit.Player, shooter);
         }
     }
 
     private void RegisterHitEffect(PlayerRuntime shooter, PlayerRuntime victim, Vec2 impactPosition)
     {
+        var id = $"hit-{Guid.NewGuid():N}";
         _hitEffects.Add(new HitEffectRuntime
         {
-            Id = $"hit-{Guid.NewGuid():N}",
+            Id = id,
             ShooterPlayerId = shooter.Id,
             VictimPlayerId = victim.Id,
             ShooterTeam = shooter.Team,
@@ -1021,6 +1291,17 @@ public sealed class GameRoom
             ImpactPosition = impactPosition,
             RemainingLifetime = HitEffectLifetimeSeconds
         });
+
+        EmitGameEvent(
+            "playerHit",
+            id: id,
+            shooter: shooter,
+            victim: victim,
+            x: impactPosition.X,
+            y: impactPosition.Y,
+            impactX: impactPosition.X,
+            impactY: impactPosition.Y,
+            life: HitEffectLifetimeSeconds);
     }
 
     private float FindClosestBlockDistance(Vec2 origin, Vec2 direction, float maxDistance)
@@ -1094,14 +1375,19 @@ public sealed class GameRoom
         return bestHit;
     }
 
-    private void EliminatePlayer(PlayerRuntime player)
+    private void EliminatePlayer(PlayerRuntime player, PlayerRuntime? eliminatedBy = null)
     {
         if (player.CarryingFlagTeam is not null && Map.FlagsByTeam.TryGetValue(player.CarryingFlagTeam, out var carriedFlag))
         {
+            var droppedFlagTeam = player.CarryingFlagTeam;
             carriedFlag.CarriedByPlayerId = null;
             carriedFlag.Position = player.Position;
             player.CarryingFlagTeam = null;
+            GetOrCreateStats(player).FlagDrops++;
+            EmitGameEvent("flagDropped", player: player, team: player.Team, flagTeam: droppedFlagTeam, x: carriedFlag.Position.X, y: carriedFlag.Position.Y);
         }
+
+        EmitGameEvent("playerEliminated", player: player, victim: player, shooter: eliminatedBy, team: player.Team, x: player.Position.X, y: player.Position.Y);
 
         var respawn = FindRespawnPosition(player);
         player.Position = respawn;
@@ -1153,59 +1439,554 @@ public sealed class GameRoom
 
     private Vec2 MoveAgainstWorld(Vec2 start, Vec2 delta, float radius)
     {
-        if (Geometry.Length(delta) <= 0.001f)
+        if (Geometry.Length(delta) <= MovementEpsilon)
         {
             return start;
         }
 
+        var collisionRadius = GetMovementCollisionRadius(radius);
         var full = start + delta;
-        if (!CollidesWithWorld(full, radius))
+        if (!CollidesWithWorld(full, collisionRadius))
         {
             return full;
         }
 
+        var surfaceSlide = TrySurfaceSlide(start, delta, collisionRadius);
+        if (GetMovementProgress(start, delta, surfaceSlide) > MovementEpsilon)
+        {
+            return surfaceSlide;
+        }
+
+        var axisSlide = TryAxisAlignedSlide(start, delta, collisionRadius);
+        if (Geometry.DistanceSquared(axisSlide, start) > MovementEpsilon * MovementEpsilon)
+        {
+            return axisSlide;
+        }
+
+        return TryPartialAxisSlide(start, delta, collisionRadius);
+    }
+
+    private static float GetMovementCollisionRadius(float radius) =>
+        MathF.Max(0f, radius - MovementCollisionContactTolerance);
+
+    private Vec2 TrySurfaceSlide(Vec2 start, Vec2 delta, float collisionRadius)
+    {
         var current = start;
-        var xOnly = new Vec2(current.X + delta.X, current.Y);
-        if (MathF.Abs(delta.X) > 0.001f && !CollidesWithWorld(xOnly, radius))
+        var remaining = delta;
+        var best = start;
+
+        for (var pass = 0; pass < MovementSlidePasses; pass++)
         {
-            current = xOnly;
+            if (Geometry.Length(remaining) <= MovementEpsilon)
+            {
+                break;
+            }
+
+            var target = current + remaining;
+            if (!CollidesWithWorld(target, collisionRadius))
+            {
+                return ChooseBestMovementCandidate(start, delta, best, target);
+            }
+
+            var lastFree = MoveToLastFreePoint(current, remaining, collisionRadius, out var travelledFraction);
+            if (Geometry.DistanceSquared(lastFree, current) > MovementEpsilon * MovementEpsilon)
+            {
+                current = lastFree;
+                best = ChooseBestMovementCandidate(start, delta, best, current);
+            }
+
+            var residual = remaining * Math.Clamp(1f - travelledFraction, 0f, 1f);
+            if (Geometry.Length(residual) <= MovementEpsilon)
+            {
+                break;
+            }
+
+            if (!TryGetSlideNormal(current, target, residual, collisionRadius, out var normal))
+            {
+                break;
+            }
+
+            normal = Geometry.Normalize(normal);
+            if (Geometry.Length(normal) <= MovementEpsilon)
+            {
+                break;
+            }
+
+            var nudgedCurrent = OffsetFromCollisionSurface(current, normal, collisionRadius);
+            if (Geometry.DistanceSquared(nudgedCurrent, current) > MovementEpsilon * MovementEpsilon)
+            {
+                current = nudgedCurrent;
+                best = ChooseBestMovementCandidate(start, delta, best, current);
+            }
+
+            var slide = ProjectMovementOntoSurface(residual, normal);
+            if (Geometry.Length(slide) <= MovementEpsilon)
+            {
+                slide = BuildTangentMovement(residual, normal);
+            }
+
+            if (Geometry.Length(slide) <= MovementEpsilon)
+            {
+                break;
+            }
+
+            var next = FindBestSlideCandidate(current, slide, residual, normal, collisionRadius);
+            var applied = next - current;
+            if (Geometry.Length(applied) <= MovementEpsilon)
+            {
+                break;
+            }
+
+            current = next;
+            best = ChooseBestMovementCandidate(start, delta, best, current);
+            remaining = slide - applied;
         }
 
-        var yOnly = new Vec2(current.X, current.Y + delta.Y);
-        if (MathF.Abs(delta.Y) > 0.001f && !CollidesWithWorld(yOnly, radius))
+        return best;
+    }
+
+    private bool TryGetSlideNormal(Vec2 current, Vec2 target, Vec2 residual, float collisionRadius, out Vec2 normal)
+    {
+        var probeRadius = collisionRadius + MovementSlideProbeMargin;
+        if (TryGetWorldCollisionNormal(target, probeRadius, out normal))
         {
-            current = yOnly;
+            return true;
         }
 
-        if (current.X != start.X || current.Y != start.Y)
+        var direction = Geometry.Normalize(residual);
+        if (Geometry.Length(direction) > MovementEpsilon &&
+            TryGetWorldCollisionNormal(current + direction * MovementSlideProbeMargin, probeRadius, out normal))
         {
-            return current;
+            return true;
         }
 
+        return TryGetWorldCollisionNormal(current, probeRadius, out normal);
+    }
+
+    private Vec2 OffsetFromCollisionSurface(Vec2 position, Vec2 normal, float collisionRadius)
+    {
+        var direction = Geometry.Normalize(normal);
+        if (Geometry.Length(direction) <= MovementEpsilon)
+        {
+            return position;
+        }
+
+        var best = position;
+        for (var i = 1; i <= 4; i++)
+        {
+            var candidate = position + direction * (MovementSlideSkin * i);
+            if (!CollidesWithWorld(candidate, collisionRadius))
+            {
+                best = candidate;
+                break;
+            }
+        }
+
+        return best;
+    }
+
+    private static Vec2 ProjectMovementOntoSurface(Vec2 movement, Vec2 normal)
+    {
+        var intoSurface = Geometry.Dot(movement, normal);
+        return intoSurface < 0f ? movement - normal * intoSurface : movement;
+    }
+
+    private static Vec2 BuildTangentMovement(Vec2 movement, Vec2 normal)
+    {
+        var tangent = new Vec2(-normal.Y, normal.X);
+        var tangentAmount = Geometry.Dot(movement, tangent);
+        return tangent * tangentAmount;
+    }
+
+    private Vec2 FindBestSlideCandidate(Vec2 start, Vec2 slide, Vec2 desiredDelta, Vec2 normal, float collisionRadius)
+    {
+        var best = start;
+        var origins = new[]
+        {
+            start,
+            OffsetFromCollisionSurface(start, normal, collisionRadius),
+            start + normal * MovementSlideSkin
+        };
+        var fractions = new[] { 1f, 0.85f, 0.7f, 0.5f, 0.35f, 0.2f, 0.1f };
+
+        foreach (var origin in origins)
+        {
+            if (CollidesWithWorld(origin, collisionRadius))
+            {
+                continue;
+            }
+
+            foreach (var fraction in fractions)
+            {
+                var candidateDelta = slide * fraction;
+                var candidate = origin + candidateDelta;
+                if (!CollidesWithWorld(candidate, collisionRadius))
+                {
+                    best = ChooseBestMovementCandidate(start, desiredDelta, best, candidate);
+                    if (fraction >= 1f)
+                    {
+                        return best;
+                    }
+
+                    continue;
+                }
+
+                var partial = MoveToLastFreePoint(origin, candidateDelta, collisionRadius, out _);
+                if (Geometry.DistanceSquared(partial, origin) > MovementEpsilon * MovementEpsilon)
+                {
+                    best = ChooseBestMovementCandidate(start, desiredDelta, best, partial);
+                }
+            }
+        }
+
+        var axisCandidate = TryAxisAlignedSlide(start, desiredDelta, collisionRadius);
+        best = ChooseBestMovementCandidate(start, desiredDelta, best, axisCandidate);
+        if (GetMovementProgress(start, desiredDelta, best) > MovementEpsilon)
+        {
+            return best;
+        }
+
+        return TryTangentAlternatives(start, desiredDelta, normal, collisionRadius);
+    }
+
+    private Vec2 TryTangentAlternatives(Vec2 start, Vec2 desiredDelta, Vec2 normal, float collisionRadius)
+    {
+        var tangent = new Vec2(-normal.Y, normal.X);
+        var amount = Geometry.Dot(desiredDelta, tangent);
+        if (MathF.Abs(amount) <= MovementEpsilon)
+        {
+            return start;
+        }
+
+        var best = start;
+        var tangentDelta = tangent * amount;
+        var fractions = new[] { 1f, 0.75f, 0.5f, 0.25f };
+        foreach (var fraction in fractions)
+        {
+            var candidate = start + tangentDelta * fraction;
+            if (!CollidesWithWorld(candidate, collisionRadius))
+            {
+                best = ChooseBestMovementCandidate(start, desiredDelta, best, candidate);
+                break;
+            }
+        }
+
+        return best;
+    }
+
+    private Vec2 TryAxisAlignedSlide(Vec2 start, Vec2 delta, float collisionRadius)
+    {
+        var xFirst = TryAxisAlignedSlideSequence(start, delta, collisionRadius, moveXFirst: true);
+        var yFirst = TryAxisAlignedSlideSequence(start, delta, collisionRadius, moveXFirst: false);
+        return ChooseBestMovementCandidate(start, delta, xFirst, yFirst);
+    }
+
+    private Vec2 TryAxisAlignedSlideSequence(Vec2 start, Vec2 delta, float collisionRadius, bool moveXFirst)
+    {
+        var current = start;
+        if (moveXFirst)
+        {
+            current = TryMoveSingleAxis(current, delta.X, true, collisionRadius);
+            current = TryMoveSingleAxis(current, delta.Y, false, collisionRadius);
+        }
+        else
+        {
+            current = TryMoveSingleAxis(current, delta.Y, false, collisionRadius);
+            current = TryMoveSingleAxis(current, delta.X, true, collisionRadius);
+        }
+
+        return current;
+    }
+
+    private Vec2 TryMoveSingleAxis(Vec2 start, float amount, bool isXAxis, float collisionRadius)
+    {
+        if (MathF.Abs(amount) <= MovementEpsilon)
+        {
+            return start;
+        }
+
+        var candidate = isXAxis
+            ? new Vec2(start.X + amount, start.Y)
+            : new Vec2(start.X, start.Y + amount);
+
+        return CollidesWithWorld(candidate, collisionRadius) ? start : candidate;
+    }
+
+    private static Vec2 ChooseBestMovementCandidate(Vec2 start, Vec2 desiredDelta, Vec2 a, Vec2 b)
+    {
+        var scoreA = GetMovementProgress(start, desiredDelta, a);
+        var scoreB = GetMovementProgress(start, desiredDelta, b);
+        if (MathF.Abs(scoreA - scoreB) > MovementEpsilon)
+        {
+            return scoreA > scoreB ? a : b;
+        }
+
+        return Geometry.DistanceSquared(a, start) >= Geometry.DistanceSquared(b, start) ? a : b;
+    }
+
+    private static float GetMovementProgress(Vec2 start, Vec2 desiredDelta, Vec2 candidate)
+    {
+        var desiredDirection = Geometry.Normalize(desiredDelta);
+        if (Geometry.Length(desiredDirection) <= MovementEpsilon)
+        {
+            return 0f;
+        }
+
+        return Geometry.Dot(candidate - start, desiredDirection);
+    }
+
+    private Vec2 TryPartialAxisSlide(Vec2 start, Vec2 delta, float collisionRadius)
+    {
         var fractions = new[] { 0.75f, 0.5f, 0.35f, 0.2f, 0.1f };
+        var best = start;
         foreach (var fraction in fractions)
         {
             var partial = delta * fraction;
             var candidate = start + partial;
-            if (!CollidesWithWorld(candidate, radius))
+            if (!CollidesWithWorld(candidate, collisionRadius))
             {
                 return candidate;
             }
 
-            xOnly = new Vec2(start.X + partial.X, start.Y);
-            if (MathF.Abs(partial.X) > 0.001f && !CollidesWithWorld(xOnly, radius))
+            var axisCandidate = TryAxisAlignedSlide(start, partial, collisionRadius);
+            best = ChooseBestMovementCandidate(start, delta, best, axisCandidate);
+            if (Geometry.DistanceSquared(best, start) > MovementEpsilon * MovementEpsilon)
             {
-                return xOnly;
-            }
-
-            yOnly = new Vec2(start.X, start.Y + partial.Y);
-            if (MathF.Abs(partial.Y) > 0.001f && !CollidesWithWorld(yOnly, radius))
-            {
-                return yOnly;
+                return best;
             }
         }
 
-        return start;
+        return best;
+    }
+
+    private Vec2 MoveToLastFreePoint(Vec2 start, Vec2 delta, float collisionRadius, out float travelledFraction)
+    {
+        travelledFraction = 0f;
+        var low = 0f;
+        var high = 1f;
+        var best = start;
+
+        for (var i = 0; i < MovementSweepIterations; i++)
+        {
+            var mid = (low + high) * 0.5f;
+            var candidate = start + delta * mid;
+            if (CollidesWithWorld(candidate, collisionRadius))
+            {
+                high = mid;
+            }
+            else
+            {
+                low = mid;
+                best = candidate;
+            }
+        }
+
+        travelledFraction = low;
+        return best;
+    }
+
+    private bool TryGetWorldCollisionNormal(Vec2 position, float radius, out Vec2 normal)
+    {
+        normal = new Vec2(0f, 0f);
+        var bestPenetration = float.NegativeInfinity;
+        var found = false;
+
+        if (TryGetPerimeterCollisionNormal(position, radius, out var perimeterNormal, out var perimeterPenetration))
+        {
+            ConsiderCollisionNormal(perimeterNormal, perimeterPenetration, ref normal, ref bestPenetration, ref found);
+        }
+
+        foreach (var obstacle in Map.Obstacles)
+        {
+            if (!obstacle.Hard)
+            {
+                continue;
+            }
+
+            if (obstacle.Type == "rect" && Geometry.CircleIntersectsRect(position, radius, obstacle) &&
+                TryGetRectCollisionNormal(position, radius, obstacle, out var rectNormal, out var rectPenetration))
+            {
+                ConsiderCollisionNormal(rectNormal, rectPenetration, ref normal, ref bestPenetration, ref found);
+            }
+            else if (obstacle.Type == "circle" && Geometry.CircleIntersectsCircle(position, radius, obstacle) &&
+                TryGetCircleCollisionNormal(position, radius, obstacle, out var circleNormal, out var circlePenetration))
+            {
+                ConsiderCollisionNormal(circleNormal, circlePenetration, ref normal, ref bestPenetration, ref found);
+            }
+            else if (obstacle.Type == "polygon" && obstacle.Points is not null &&
+                Geometry.CircleIntersectsPolygon(position, radius, obstacle.Points) &&
+                TryGetPolygonCollisionNormal(position, radius, obstacle.Points, out var polygonNormal, out var polygonPenetration))
+            {
+                ConsiderCollisionNormal(polygonNormal, polygonPenetration, ref normal, ref bestPenetration, ref found);
+            }
+        }
+
+        return found;
+    }
+
+    private bool TryGetPerimeterCollisionNormal(Vec2 position, float radius, out Vec2 normal, out float penetration)
+    {
+        normal = new Vec2(0f, 0f);
+        penetration = 0f;
+
+        var inside = Geometry.PointInPolygon(position, Map.Perimeter.Points);
+        var nearest = FindNearestPointOnPolygon(position, Map.Perimeter.Points, out var distance);
+        if (inside && distance >= radius)
+        {
+            return false;
+        }
+
+        var rawNormal = inside ? position - nearest : nearest - position;
+        normal = NormalizeOrFallback(rawNormal, new Vec2(0f, inside ? 1f : -1f));
+        penetration = inside ? radius - distance : radius + distance;
+        return true;
+    }
+
+    private static bool TryGetRectCollisionNormal(Vec2 position, float radius, ObstacleShape rect, out Vec2 normal, out float penetration)
+    {
+        normal = new Vec2(0f, 0f);
+        penetration = 0f;
+
+        var minX = rect.Position.X;
+        var maxX = rect.Position.X + rect.Width;
+        var minY = rect.Position.Y;
+        var maxY = rect.Position.Y + rect.Height;
+        var nearest = new Vec2(Math.Clamp(position.X, minX, maxX), Math.Clamp(position.Y, minY, maxY));
+        var offset = position - nearest;
+        var distance = Geometry.Length(offset);
+        if (distance > MovementEpsilon)
+        {
+            normal = offset * (1f / distance);
+            penetration = radius - distance;
+            return true;
+        }
+
+        var left = MathF.Abs(position.X - minX);
+        var right = MathF.Abs(maxX - position.X);
+        var top = MathF.Abs(position.Y - minY);
+        var bottom = MathF.Abs(maxY - position.Y);
+        var nearestSide = MathF.Min(MathF.Min(left, right), MathF.Min(top, bottom));
+
+        if (nearestSide == left)
+        {
+            normal = new Vec2(-1f, 0f);
+            penetration = radius + left;
+        }
+        else if (nearestSide == right)
+        {
+            normal = new Vec2(1f, 0f);
+            penetration = radius + right;
+        }
+        else if (nearestSide == top)
+        {
+            normal = new Vec2(0f, -1f);
+            penetration = radius + top;
+        }
+        else
+        {
+            normal = new Vec2(0f, 1f);
+            penetration = radius + bottom;
+        }
+
+        return true;
+    }
+
+    private static bool TryGetCircleCollisionNormal(Vec2 position, float radius, ObstacleShape circle, out Vec2 normal, out float penetration)
+    {
+        var offset = position - circle.Position;
+        var distance = Geometry.Length(offset);
+        normal = NormalizeOrFallback(offset, new Vec2(1f, 0f));
+        penetration = radius + circle.Radius - distance;
+        return true;
+    }
+
+    private static bool TryGetPolygonCollisionNormal(Vec2 position, float radius, List<Vec2> points, out Vec2 normal, out float penetration)
+    {
+        normal = new Vec2(0f, 0f);
+        penetration = 0f;
+        if (points.Count == 0)
+        {
+            return false;
+        }
+
+        var inside = Geometry.PointInPolygon(position, points);
+        var nearest = FindNearestPointOnPolygon(position, points, out var distance);
+        var outward = position - nearest;
+        normal = inside
+            ? NormalizeOrFallback(new Vec2(-outward.X, -outward.Y), position - GetPolygonCentroid(points))
+            : NormalizeOrFallback(outward, position - GetPolygonCentroid(points));
+        penetration = inside ? radius + distance : radius - distance;
+        return true;
+    }
+
+    private static Vec2 FindNearestPointOnPolygon(Vec2 point, List<Vec2> points, out float distance)
+    {
+        var nearest = points[0];
+        distance = float.MaxValue;
+        for (var i = 0; i < points.Count; i++)
+        {
+            var a = points[i];
+            var b = points[(i + 1) % points.Count];
+            var candidate = ClosestPointOnSegment(point, a, b);
+            var candidateDistance = Geometry.Length(point - candidate);
+            if (candidateDistance < distance)
+            {
+                distance = candidateDistance;
+                nearest = candidate;
+            }
+        }
+
+        return nearest;
+    }
+
+    private static Vec2 ClosestPointOnSegment(Vec2 point, Vec2 a, Vec2 b)
+    {
+        var ab = b - a;
+        var abLengthSq = Geometry.Dot(ab, ab);
+        if (abLengthSq <= MovementEpsilon)
+        {
+            return a;
+        }
+
+        var t = Math.Clamp(Geometry.Dot(point - a, ab) / abLengthSq, 0f, 1f);
+        return a + ab * t;
+    }
+
+    private static Vec2 GetPolygonCentroid(List<Vec2> points)
+    {
+        var x = 0f;
+        var y = 0f;
+        foreach (var point in points)
+        {
+            x += point.X;
+            y += point.Y;
+        }
+
+        return new Vec2(x / points.Count, y / points.Count);
+    }
+
+    private static Vec2 NormalizeOrFallback(Vec2 vector, Vec2 fallback)
+    {
+        var normalized = Geometry.Normalize(vector);
+        if (Geometry.Length(normalized) > MovementEpsilon)
+        {
+            return normalized;
+        }
+
+        normalized = Geometry.Normalize(fallback);
+        return Geometry.Length(normalized) > MovementEpsilon ? normalized : new Vec2(1f, 0f);
+    }
+
+    private static void ConsiderCollisionNormal(Vec2 candidate, float penetration, ref Vec2 normal, ref float bestPenetration, ref bool found)
+    {
+        if (Geometry.Length(candidate) <= MovementEpsilon || penetration < bestPenetration)
+        {
+            return;
+        }
+
+        normal = candidate;
+        bestPenetration = penetration;
+        found = true;
     }
 
     private bool TryApplyWorldTranslation(PlayerRuntime player, Vec2 delta, out float appliedDistance)
@@ -1293,7 +2074,10 @@ public sealed class GameRoom
             && !ownFlag.IsAtBase
             && Geometry.DistanceSquared(player.Position, ownFlag.Position) <= 26f * 26f)
         {
+            var returnedAt = ownFlag.Position;
             ownFlag.ResetToBase();
+            GetOrCreateStats(player).FlagReturns++;
+            EmitGameEvent("flagReturned", player: player, team: player.Team, flagTeam: ownFlag.Team, x: returnedAt.X, y: returnedAt.Y);
         }
 
         if (player.CarryingFlagTeam is null)
@@ -1303,6 +2087,8 @@ public sealed class GameRoom
                 player.CarryingFlagTeam = enemyFlag.Team;
                 enemyFlag.CarriedByPlayerId = player.Id;
                 enemyFlag.Position = player.Position;
+                GetOrCreateStats(player).FlagPickups++;
+                EmitGameEvent("flagPickedUp", player: player, team: player.Team, flagTeam: enemyFlag.Team, x: player.Position.X, y: player.Position.Y);
             }
         }
         else if (player.CarryingFlagTeam == enemyTeam)
@@ -1318,10 +2104,122 @@ public sealed class GameRoom
                     _redScore++;
                 }
 
+                GetOrCreateStats(player).FlagCaptures++;
+                EmitGameEvent("flagCaptured", player: player, team: player.Team, flagTeam: enemyFlag.Team, x: player.Position.X, y: player.Position.Y, blueScore: _blueScore, redScore: _redScore);
+
                 enemyFlag.ResetToBase();
                 player.CarryingFlagTeam = null;
             }
         }
+    }
+
+
+    private PlayerStatsRuntime GetOrCreateStats(PlayerRuntime player)
+    {
+        if (_playerStats.TryGetValue(player.Id, out var stats))
+        {
+            return stats;
+        }
+
+        stats = new PlayerStatsRuntime
+        {
+            PlayerId = player.Id,
+            Name = player.Name,
+            Team = player.Team
+        };
+        _playerStats[player.Id] = stats;
+        return stats;
+    }
+
+    private void EmitGameEvent(
+        string type,
+        string? id = null,
+        PlayerRuntime? player = null,
+        PlayerRuntime? shooter = null,
+        PlayerRuntime? victim = null,
+        string? team = null,
+        string? flagTeam = null,
+        string? winnerTeam = null,
+        string? loserTeam = null,
+        float? x = null,
+        float? y = null,
+        float? impactX = null,
+        float? impactY = null,
+        float? life = null,
+        int? blueScore = null,
+        int? redScore = null)
+    {
+        if (!IsTrainingTelemetryEnabled)
+        {
+            return;
+        }
+
+        var primaryPlayer = player ?? shooter ?? victim;
+        _frameEvents.Add(new GameEventRuntime
+        {
+            Id = id ?? $"evt-{Guid.NewGuid():N}",
+            Sequence = ++_eventSequence,
+            MatchId = _matchId,
+            Type = type,
+            ServerTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            PlayerId = primaryPlayer?.Id,
+            PlayerName = primaryPlayer?.Name,
+            Team = team ?? primaryPlayer?.Team,
+            ShooterPlayerId = shooter?.Id,
+            ShooterTeam = shooter?.Team,
+            VictimPlayerId = victim?.Id,
+            VictimTeam = victim?.Team,
+            FlagTeam = flagTeam,
+            WinnerTeam = winnerTeam,
+            LoserTeam = loserTeam,
+            X = x,
+            Y = y,
+            ImpactX = impactX,
+            ImpactY = impactY,
+            Life = life,
+            BlueScore = blueScore,
+            RedScore = redScore
+        });
+    }
+
+    private static string CreateMatchId()
+    {
+        return $"m-{Guid.NewGuid():N}";
+    }
+
+    private GameEventRuntime[] BuildEventsPayload()
+    {
+        return IsTrainingTelemetryEnabled ? _frameEvents.ToArray() : Array.Empty<GameEventRuntime>();
+    }
+
+    private object[] BuildPlayerStatsPayload()
+    {
+        if (!IsTrainingTelemetryEnabled)
+        {
+            return Array.Empty<object>();
+        }
+
+        return _playerStats.Values
+            .OrderBy(stats => stats.Team, StringComparer.Ordinal)
+            .ThenBy(stats => stats.Name, StringComparer.Ordinal)
+            .Select(stats => (object)new
+            {
+                playerId = stats.PlayerId,
+                name = stats.Name,
+                team = stats.Team,
+                shotsFired = stats.ShotsFired,
+                hitsDealt = stats.HitsDealt,
+                hitsTaken = stats.HitsTaken,
+                eliminations = stats.Eliminations,
+                deaths = stats.Deaths,
+                flagPickups = stats.FlagPickups,
+                flagDrops = stats.FlagDrops,
+                flagReturns = stats.FlagReturns,
+                flagCaptures = stats.FlagCaptures,
+                carrySeconds = MathF.Round(stats.CarrySeconds * 100f) / 100f,
+                distanceTravelled = MathF.Round(stats.DistanceTravelled * 10f) / 10f
+            })
+            .ToArray();
     }
 
     private string BuildStatePayload()
@@ -1331,14 +2229,17 @@ public sealed class GameRoom
         {
             type = "state",
             roomId = RoomId,
+            sequence = _stateSequence,
+            matchId = _matchId,
             serverTime = now.ToUnixTimeMilliseconds(),
             scores = new { blue = _blueScore, red = _redScore },
             match = new
             {
+                id = _matchId,
                 status = _matchFinished ? "finished" : "running",
-                durationSeconds = MatchDurationSeconds,
+                durationSeconds = IsMatchClockDisabled ? 0 : (int)CurrentMatchDuration.TotalSeconds,
                 startedAt = _matchStartedAtUtc.ToUnixTimeMilliseconds(),
-                endsAt = _matchEndsAtUtc.ToUnixTimeMilliseconds(),
+                endsAt = IsMatchClockDisabled ? (long?)null : _matchEndsAtUtc.ToUnixTimeMilliseconds(),
                 remainingMs = GetMatchRemainingMilliseconds(now),
                 winnerTeam = _winnerTeam,
                 loserTeam = _loserTeam,
@@ -1379,18 +2280,16 @@ public sealed class GameRoom
                 endY = shot.End.Y,
                 life = shot.RemainingLifetime
             }).ToArray(),
-            events = _hitEffects.Select(effect => new
+            events = BuildEventsPayload(),
+            playerStats = BuildPlayerStatsPayload(),
+            training = new
             {
-                id = effect.Id,
-                type = "playerHit",
-                shooterPlayerId = effect.ShooterPlayerId,
-                victimPlayerId = effect.VictimPlayerId,
-                shooterTeam = effect.ShooterTeam,
-                victimTeam = effect.VictimTeam,
-                impactX = effect.ImpactPosition.X,
-                impactY = effect.ImpactPosition.Y,
-                life = effect.RemainingLifetime
-            }).ToArray()
+                enabled = _runtimeOptions.TrainingMode,
+                timeScale = _runtimeOptions.TimeScale,
+                runAsFastAsPossible = _runtimeOptions.RunAsFastAsPossible,
+                maxSimulationStepSeconds = _runtimeOptions.MaxSimulationStepSeconds,
+                maxSimulationSubstepsPerTick = _runtimeOptions.MaxSimulationSubstepsPerTick
+            }
         };
 
         return JsonSerializer.Serialize(dto, _jsonOptions);
@@ -1504,8 +2403,18 @@ public sealed class GameRoom
                 removedPlayer = player;
                 if (player.CarryingFlagTeam is not null && Map.FlagsByTeam.TryGetValue(player.CarryingFlagTeam, out var flag))
                 {
+                    var droppedFlagTeam = player.CarryingFlagTeam;
                     flag.ResetToBase();
+                    if (_playerStats.TryGetValue(player.Id, out var stats))
+                    {
+                        stats.FlagDrops++;
+                    }
+
+                    EmitGameEvent("flagDropped", player: player, team: player.Team, flagTeam: droppedFlagTeam, x: player.Position.X, y: player.Position.Y);
                 }
+
+                EmitGameEvent("playerLeft", player: player, team: player.Team, x: player.Position.X, y: player.Position.Y);
+                _playerStats.Remove(playerId);
             }
 
             roomIsEmpty = _players.Count == 0 && _clients.Count == 0;
@@ -1534,8 +2443,13 @@ public sealed class GameRoom
         }
     }
 
-    private string ChooseTeam()
+    private string ChooseTeam(string requestedTeam)
     {
+        if (requestedTeam is "blue" or "red")
+        {
+            return requestedTeam;
+        }
+
         var blue = _players.Values.Count(p => p.Team == "blue");
         var red = _players.Values.Count(p => p.Team == "red");
         return blue <= red ? "blue" : "red";
@@ -1568,7 +2482,7 @@ public sealed class GameRoom
         }
 
         var centralHalfWidth = MathF.Min(MathF.Max(Map.Width * 0.24f, radius * 6f), 460f);
-        var verticalHalfHeight = MathF.Min(MathF.Max(Map.Height * 0.15f, radius * 6f), 190f);
+        var verticalHalfHeight = MathF.Min(MathF.Max(Map.Height * PreferredSpawnScatterVerticalRatio, radius * 5f), 110f);
 
         for (var i = 0; i < 160; i++)
         {
@@ -1620,11 +2534,11 @@ public sealed class GameRoom
             if (team == "red")
             {
                 minY = edgeInset;
-                maxY = MathF.Min(Map.Height - edgeInset, MathF.Max(edgeInset, Map.Height * 0.38f));
+                maxY = MathF.Min(Map.Height - edgeInset, MathF.Max(edgeInset, Map.Height * PreferredSpawnEdgeBandRatio));
             }
             else
             {
-                minY = MathF.Max(edgeInset, MathF.Min(Map.Height - edgeInset, Map.Height * 0.62f));
+                minY = MathF.Max(edgeInset, MathF.Min(Map.Height - edgeInset, Map.Height * (1f - PreferredSpawnEdgeBandRatio)));
                 maxY = Map.Height - edgeInset;
             }
         }
@@ -1682,9 +2596,10 @@ public sealed class GameRoom
     private Vec2 GetTeamSpawnAnchor(string team, float radius)
     {
         var edgeInset = radius + 28f;
+        var maxInside = MathF.Max(edgeInset, Map.Height - edgeInset);
         var x = Math.Clamp(Map.Width * 0.5f, edgeInset, MathF.Max(edgeInset, Map.Width - edgeInset));
-        var topY = Math.Clamp(Map.Height * 0.14f, edgeInset, MathF.Max(edgeInset, Map.Height - edgeInset));
-        var bottomY = Math.Clamp(Map.Height * 0.86f, edgeInset, MathF.Max(edgeInset, Map.Height - edgeInset));
+        var topY = Math.Clamp(Map.Height * SpawnAnchorEdgeRatio, edgeInset, maxInside);
+        var bottomY = Math.Clamp(Map.Height * (1f - SpawnAnchorEdgeRatio), edgeInset, maxInside);
         return team == "red" ? new Vec2(x, topY) : new Vec2(x, bottomY);
     }
 
@@ -1701,10 +2616,10 @@ public sealed class GameRoom
 
         if (team == "red")
         {
-            return candidate.Y >= edgeInset && candidate.Y <= MathF.Max(edgeInset, Map.Height * 0.40f);
+            return candidate.Y >= edgeInset && candidate.Y <= MathF.Max(edgeInset, Map.Height * PreferredSpawnEdgeBandRatio);
         }
 
-        return candidate.Y >= MathF.Min(Map.Height - edgeInset, Map.Height * 0.60f) && candidate.Y <= Map.Height - edgeInset;
+        return candidate.Y >= MathF.Min(Map.Height - edgeInset, Map.Height * (1f - PreferredSpawnEdgeBandRatio)) && candidate.Y <= Map.Height - edgeInset;
     }
 
     private bool IsClearSpawn(Vec2 spawn, float radius, string? ignoredPlayerId)

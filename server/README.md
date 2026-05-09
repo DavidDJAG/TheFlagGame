@@ -165,6 +165,67 @@ Examples:
 
 If the room does not exist and the active-room limit has not been reached, it is created automatically.
 
+### Selecting a team on connect
+
+The WebSocket endpoint also accepts an optional `team` query parameter:
+
+```text
+/ws?team=<auto|blue|red>
+/ws?room=<roomId>&team=<auto|blue|red>
+```
+
+Supported values:
+
+- `auto`: default behavior; the server assigns the player to the currently smaller team.
+- `blue`: force the new player into the blue team.
+- `red`: force the new player into the red team.
+
+Missing or empty `team` is treated as `auto`, so older clients keep the same behavior.
+
+Examples:
+
+```text
+/ws
+/ws?team=auto
+/ws?team=blue
+/ws?room=alpha&team=red
+```
+
+Invalid `team` values are rejected with `400 Bad Request` before the WebSocket is accepted.
+
+### Joining as spectator
+
+The WebSocket endpoint accepts an optional `spectator` query parameter:
+
+```text
+/ws?spectator=<true|false>
+/ws?room=<roomId>&spectator=<true|false>
+```
+
+Supported truthy values: `true`, `1`, `yes`.
+Supported falsy values: `false`, `0`, `no`.
+
+Missing or empty `spectator` is treated as `false`, so older clients keep joining as players.
+
+Examples:
+
+```text
+/ws?spectator=true
+/ws?room=alpha&spectator=true
+/ws?room=alpha&spectator=false&team=blue
+```
+
+Spectator clients:
+
+- receive the initial `welcome` message and all regular `state` snapshots;
+- do not create a player entity;
+- do not count against `MaxPlayersPerRoom`;
+- are allowed to join full rooms;
+- can receive `pong` responses to `ping`;
+- cannot move, shoot, rename a player, or reset the match.
+
+When `spectator=true`, the `team` query parameter is ignored. Invalid `spectator` values are rejected with `400 Bad Request` before the WebSocket is accepted.
+
 ### Room ID validation
 
 The server normalizes room IDs by trimming whitespace and converting to lowercase. Empty or missing values become `public`.
@@ -203,20 +264,21 @@ Rooms that become empty are scheduled for cleanup. The current retention period 
 Each room runs the same authoritative simulation rules:
 
 - fixed `20` Hz tick rate;
-- automatic `blue` / `red` team assignment on connect;
+- automatic `blue` / `red` team assignment on connect by default, with optional `team=blue` or `team=red` override;
 - balanced randomized team reassignment on `resetGame`;
 - 5-minute match clock owned by the server;
 - match-finished state when the timer reaches zero;
 - winner, loser, or tie calculation from final scores;
 - movement driven by discrete directional input;
 - world collision against perimeter, rectangles, circles, and polygons;
+- wall sliding when diagonal movement hits hard geometry, so players can keep moving along the wall instead of getting stuck on contact;
 - soft separation between overlapping players;
 - independent room-local scoring, flags, shots, events, and timer.
 
 ### Spawn rules
 
-- Red players spawn in the upper-center area of the map.
-- Blue players spawn in the lower-center area of the map.
+- Red players spawn in a narrow band near the upper edge of the map.
+- Blue players spawn in a narrow band near the lower edge of the map.
 - The server first tries the preferred team zone.
 - If the ideal area is blocked, it searches nearby collision-free points.
 - If the preferred zone is unavailable, it searches the corresponding team half.
@@ -407,10 +469,10 @@ If the active-room limit has been reached, the server returns `429 Too Many Requ
 ### Endpoint
 
 ```text
-/ws?room=<roomId>
+/ws?room=<roomId>&team=<auto|blue|red>
 ```
 
-The `room` query parameter is optional. Missing or empty values use `public`.
+Both query parameters are optional. Missing or empty `room` uses `public`. Missing or empty `team` uses `auto`, preserving balanced auto-assignment.
 
 ### Client to server
 
@@ -440,8 +502,32 @@ Initial message:
 {
   "type": "welcome",
   "roomId": "alpha",
+  "connectionId": "p-123",
   "playerId": "p-123",
+  "role": "player",
+  "spectator": false,
   "team": "blue",
+  "teamSelection": {
+    "requested": "auto",
+    "autoAssigned": true
+  },
+  "tickRate": 20,
+  "mapName": "Blaze Field"
+}
+```
+
+For spectators, `connectionId` is generated with an `s-` prefix, `playerId` and `team` are `null`, `role` is `spectator`, and `spectator` is `true`:
+
+```json
+{
+  "type": "welcome",
+  "roomId": "alpha",
+  "connectionId": "s-456",
+  "playerId": null,
+  "role": "spectator",
+  "spectator": true,
+  "team": null,
+  "teamSelection": null,
   "tickRate": 20,
   "mapName": "Blaze Field"
 }
@@ -551,7 +637,7 @@ It also consumes these obstacle types:
 
 `meta.canvas.width` and `meta.canvas.height` define the logical world size.
 
-Spawn zones are not part of the current map schema. They are calculated by the backend from the canvas dimensions and team color.
+Spawn zones are not part of the current map schema. They are calculated by the backend from the canvas dimensions and team color, using an upper/lower edge band instead of a central vertical band.
 
 ## Included map
 
@@ -690,3 +776,136 @@ Expected results:
 
 **David Jorge Aguirre Grazio**  
 Developer
+
+## Training-oriented server mode
+
+The authoritative server can run either with production-safe runtime settings or with training-oriented settings for bot preparation.
+
+Runtime settings are read from `server-runtime.json` in `AppContext.BaseDirectory`. Environment variables are not used.
+
+Behavior is intentionally fail-safe:
+
+- If `server-runtime.json` is missing, the server uses `ServerRuntimeOptions.Production` (`trainingMode=false`).
+- If `server-runtime.json` exists but has `"trainingMode": false`, all other runtime values in the JSON are ignored and production settings are used.
+- If `server-runtime.json` has `"trainingMode": true`, the server uses the JSON values after clamping unsafe numeric ranges.
+
+Default production `server-runtime.json`:
+
+```json
+{
+  "trainingMode": false,
+  "tickRate": 20,
+  "timeScale": 1,
+  "runAsFastAsPossible": false,
+  "matchDurationSecondsOverride": null,
+  "resetCooldownSeconds": 60,
+  "autoResetFinishedMatches": false,
+  "disableClientIdleTimeout": false,
+  "maxMessagesPerRateLimitWindow": 200,
+  "maxSimulationStepSeconds": 0.016666667,
+  "maxSimulationSubstepsPerTick": 3
+}
+```
+
+Example training preset:
+
+```json
+{
+  "trainingMode": true,
+  "tickRate": 60,
+  "timeScale": 8,
+  "runAsFastAsPossible": false,
+  "matchDurationSecondsOverride": 300,
+  "resetCooldownSeconds": 0,
+  "autoResetFinishedMatches": true,
+  "disableClientIdleTimeout": true,
+  "maxMessagesPerRateLimitWindow": 0,
+  "maxSimulationStepSeconds": 0.008333333,
+  "maxSimulationSubstepsPerTick": 64
+}
+```
+
+Relevant settings when `trainingMode=true`:
+
+- `tickRate`: simulation snapshots per second.
+- `timeScale`: multiplies the amount of simulation time processed per wall-clock tick. Movement/collision are split into physics substeps so accelerated training does not create large single-frame jumps.
+- `maxSimulationStepSeconds`: maximum physics step used internally. `0.008333333` is 120 Hz physics. Lower values reduce tunneling risk but cost more CPU.
+- `maxSimulationSubstepsPerTick`: safety cap for how many physics substeps may be processed for a single network tick.
+- `runAsFastAsPossible`: when `true`, the loop does not wait between ticks and advances by a fixed `1 / tickRate` base step, still split through the physics substepper. This is CPU-intensive and intended for local/headless experiments.
+- `matchDurationSecondsOverride`: set `0` to disable the match timer. Use `null` to use the normal five-minute match length.
+- `resetCooldownSeconds`: set `0` to allow immediate `resetGame` messages.
+- `disableClientIdleTimeout`: disables the 30 second WebSocket idle removal.
+- `maxMessagesPerRateLimitWindow`: set `0` to disable the inbound message rate limit. This only disables the limit when `trainingMode=true`.
+
+State snapshots always include top-level `sequence` and `matchId`, plus `match.id`.
+
+When `trainingMode=true`, state snapshots also include populated `events` and `playerStats` training telemetry. When `trainingMode=false`, those arrays are emitted empty and the server avoids generating training event/stat data.
+
+Training events include:
+
+- `matchReset`
+- `matchFinished`
+- `playerJoined`
+- `playerLeft`
+- `shotFired`
+- `playerHit`
+- `playerEliminated`
+- `flagPickedUp`
+- `flagDropped`
+- `flagReturned`
+- `flagCaptured`
+
+`playerHit` preserves the old client-compatible fields `impactX`, `impactY`, `shooterPlayerId`, `victimPlayerId`, `shooterTeam`, `victimTeam` and `life`.
+
+Example `playerStats` payload:
+
+```json
+{
+  "playerId": "p-...",
+  "name": "QL-03",
+  "team": "blue",
+  "shotsFired": 14,
+  "hitsDealt": 4,
+  "hitsTaken": 2,
+  "eliminations": 4,
+  "deaths": 2,
+  "flagPickups": 2,
+  "flagDrops": 1,
+  "flagReturns": 1,
+  "flagCaptures": 1,
+  "carrySeconds": 12.4,
+  "distanceTravelled": 3902.8
+}
+```
+
+## Training run preset
+
+This package is configured for validation runs with:
+
+```json
+{
+  "matchDurationSecondsOverride": 300
+}
+```
+
+That creates 5-minute episodes. With the bot package default `maxRuntimeSeconds: 900`, a validation run should produce about three match summaries in 15 minutes. Set `matchDurationSecondsOverride` back to `0` for an infinite match.
+
+## Training episodes v3
+
+This package adds `autoResetFinishedMatches` to `server-runtime.json`.
+
+Recommended 15-minute validation settings:
+
+```json
+{
+  "matchDurationSecondsOverride": 300,
+  "resetCooldownSeconds": 0,
+  "autoResetFinishedMatches": true
+}
+```
+
+When a match reaches `matchDurationSecondsOverride`, the server emits one `matchFinished` state/event, then automatically creates the next `matchId` and emits `matchReset`. This keeps long training runs split into clean episodes.
+
+## Movement collision update
+
+The player movement resolver now uses surface-aware sliding before falling back to axis-only movement. When a move collides with a hard obstacle, the server sweeps to the last free point, probes the impacted surface normal, offsets the player slightly away from the surface, and projects the remaining movement onto the tangent. This specifically improves glancing collisions against circular obstacles and sharp polygon/rectangle corners so players keep sliding instead of getting stuck until they walk away from the wall.

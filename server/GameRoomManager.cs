@@ -15,16 +15,18 @@ public sealed class GameRoomManager
     private readonly CancellationTokenSource _cts = new();
     private readonly string _mapPath;
     private readonly ILogger _logger;
+    private readonly ServerRuntimeOptions _runtimeOptions;
     private int _activeConnectionScopes;
 
-    public GameRoomManager(string mapPath, ILogger logger)
+    public GameRoomManager(string mapPath, ILogger logger, ServerRuntimeOptions? runtimeOptions = null)
     {
         _mapPath = mapPath;
         _logger = logger;
+        _runtimeOptions = runtimeOptions ?? ServerRuntimeOptions.Production;
         _ = MapLoader.LoadMapFromFile(mapPath);
     }
 
-    public int TickRate => 20;
+    public int TickRate => Math.Max(1, _runtimeOptions.TickRate);
     public int MaxPlayersPerRoom => GameRoom.MaxPlayersPerRoom;
     public int MaxRooms => MaxActiveRooms;
 
@@ -163,7 +165,7 @@ public sealed class GameRoomManager
             }
             else
             {
-                var room = new GameRoom(roomId, _mapPath, _logger, ScheduleEmptyRoomCleanup);
+                var room = new GameRoom(roomId, _mapPath, _logger, ScheduleEmptyRoomCleanup, _runtimeOptions);
                 room.Start();
                 _rooms[roomId] = room;
                 _logger.LogInformation("Room created: {RoomId}", roomId);
@@ -242,6 +244,23 @@ public sealed class GameRoomManager
             return;
         }
 
+        if (!GameRoom.TryReadSpectatorMode(context, out var isSpectator, out var spectatorModeError))
+        {
+            _logger.LogWarning("Rejected invalid spectator mode '{Spectator}' from WebSocket request for room {RoomId}.", context.Request.Query["spectator"].ToString(), roomId);
+            context.Response.StatusCode = StatusCodes.Status400BadRequest;
+            await context.Response.WriteAsync(spectatorModeError ?? "Invalid spectator mode.");
+            return;
+        }
+
+        var requestedTeam = "auto";
+        if (!isSpectator && !GameRoom.TryReadTeamPreference(context, out requestedTeam, out var teamPreferenceError))
+        {
+            _logger.LogWarning("Rejected invalid team preference '{Team}' from WebSocket request for room {RoomId}.", context.Request.Query["team"].ToString(), roomId);
+            context.Response.StatusCode = StatusCodes.Status400BadRequest;
+            await context.Response.WriteAsync(teamPreferenceError ?? "Invalid team preference.");
+            return;
+        }
+
         GameRoom? room = null;
         List<GameRoom> roomsToStop = [];
         int? rejectionStatusCode = null;
@@ -261,14 +280,14 @@ public sealed class GameRoomManager
                 }
                 else
                 {
-                    room = new GameRoom(roomId, _mapPath, _logger, ScheduleEmptyRoomCleanup);
+                    room = new GameRoom(roomId, _mapPath, _logger, ScheduleEmptyRoomCleanup, _runtimeOptions);
                     room.Start();
                     _rooms[roomId] = room;
                     _logger.LogInformation("Room created: {RoomId}", roomId);
                 }
             }
 
-            if (rejectionStatusCode is null && room is not null && room.PlayerCount >= GameRoom.MaxPlayersPerRoom)
+            if (!isSpectator && rejectionStatusCode is null && room is not null && room.PlayerCount >= GameRoom.MaxPlayersPerRoom)
             {
                 _logger.LogWarning("Room {RoomId} is full.", roomId);
                 rejectionStatusCode = StatusCodes.Status429TooManyRequests;
@@ -292,7 +311,7 @@ public sealed class GameRoomManager
 
         try
         {
-            await room.HandleClientAsync(context);
+            await room.HandleClientAsync(context, requestedTeam, isSpectator);
         }
         finally
         {

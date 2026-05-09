@@ -1,4 +1,4 @@
-const CACHE_VERSION = 'the-flag-v3';
+const CACHE_VERSION = 'the-flag-v5';
 const APP_SHELL = [
   './',
   './index.html',

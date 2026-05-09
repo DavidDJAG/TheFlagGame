@@ -1,0 +1,13 @@
+{
+  "trainingMode": false,
+  "tickRate": 60,
+  "timeScale": 1,
+  "runAsFastAsPossible": false,
+  "matchDurationSecondsOverride": 300,
+  "resetCooldownSeconds": 0,
+  "autoResetFinishedMatches": true,
+  "disableClientIdleTimeout": true,
+  "maxMessagesPerRateLimitWindow": 0,
+  "maxSimulationStepSeconds": 0.008333333,
+  "maxSimulationSubstepsPerTick": 64
+}
