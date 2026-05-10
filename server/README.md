@@ -1,6 +1,6 @@
 # THE FLAG Server
 
-Authoritative ASP.NET Core backend for **THE FLAG**, a real-time multiplayer capture-the-flag prototype. The server owns the game simulation, exposes the HTTP API, accepts WebSocket clients, loads the base map from `server/Data/map.json`, and can optionally serve the PWA client from `../client-pwa`.
+Authoritative ASP.NET Core backend for **THE FLAG**, a real-time multiplayer capture-the-flag prototype. The server owns the game simulation, exposes the HTTP API, accepts WebSocket clients, loads the base map from `server/Data/map.json`, supports team preference and spectator connections, can emit training telemetry when `trainingMode=true`, and can optionally serve the PWA client from `../client-pwa`.
 
 ## Current capabilities
 
@@ -11,6 +11,10 @@ Authoritative ASP.NET Core backend for **THE FLAG**, a real-time multiplayer cap
 - Global active-room limit: `24` rooms.
 - Automatic cleanup of empty rooms after a short retention period.
 - Authoritative movement, collision, shooting, flag capture, scoring, match timer, match finish, and reset logic.
+- Team preference on connect through `team=auto|blue|red`.
+- Spectator connections through `spectator=true`.
+- Reset logic that preserves fixed `blue` / `red` requested teams and only rebalances `auto` players.
+- Training-oriented runtime mode through `server-runtime.json` with telemetry for synthetic AI training datasets.
 - Global base map API for the map editor.
 - Safe map replacement only when no players or WebSocket clients are active in any room.
 - Room listing and explicit room creation API.
@@ -31,6 +35,7 @@ server/
   MapLoader.cs
   Models.cs
   Program.cs
+  server-runtime.json
   TheFlag.Server.csproj
   TheFlag.Server.sln
   icon.ico
@@ -72,7 +77,7 @@ Each `GameRoom` is an isolated authoritative match instance. A room contains its
 
 - players;
 - WebSocket clients;
-- teams;
+- current teams and original requested team preferences;
 - positions;
 - inputs;
 - scores;
@@ -118,6 +123,8 @@ http://0.0.0.0:5770
 - Rooms API: `http://127.0.0.1:5770/api/rooms`
 - Default WebSocket room: `ws://127.0.0.1:5770/ws`
 - Named WebSocket room: `ws://127.0.0.1:5770/ws?room=alpha`
+- Team-selected WebSocket player: `ws://127.0.0.1:5770/ws?room=alpha&team=blue`
+- Spectator WebSocket client: `ws://127.0.0.1:5770/ws?room=alpha&spectator=true`
 - PWA client served by the backend: `http://127.0.0.1:5770/pwa/`
 
 ## PWA serving behavior
@@ -191,7 +198,7 @@ Examples:
 /ws?room=alpha&team=red
 ```
 
-Invalid `team` values are rejected with `400 Bad Request` before the WebSocket is accepted.
+Invalid `team` values are rejected with `400 Bad Request` before the WebSocket is accepted. The accepted request is stored in `PlayerRuntime.RequestedTeam`; this is intentionally separate from the mutable `Team` value so the reset flow can preserve fixed selections.
 
 ### Joining as spectator
 
@@ -263,9 +270,10 @@ Rooms that become empty are scheduled for cleanup. The current retention period 
 
 Each room runs the same authoritative simulation rules:
 
-- fixed `20` Hz tick rate;
-- automatic `blue` / `red` team assignment on connect by default, with optional `team=blue` or `team=red` override;
-- balanced randomized team reassignment on `resetGame`;
+- fixed `20` Hz tick rate in production mode;
+- automatic balanced `blue` / `red` team assignment on connect by default;
+- optional fixed `team=blue` or `team=red` preference on connect;
+- reset-time team handling that preserves fixed requested teams and only rebalances players whose requested team is `auto`;
 - 5-minute match clock owned by the server;
 - match-finished state when the timer reaches zero;
 - winner, loser, or tie calculation from final scores;
@@ -274,6 +282,25 @@ Each room runs the same authoritative simulation rules:
 - wall sliding when diagonal movement hits hard geometry, so players can keep moving along the wall instead of getting stuck on contact;
 - soft separation between overlapping players;
 - independent room-local scoring, flags, shots, events, and timer.
+
+
+### Team selection and reset behavior
+
+The connection-level team preference is parsed before the WebSocket is accepted:
+
+```text
+/ws?room=alpha&team=auto
+/ws?room=alpha&team=blue
+/ws?room=alpha&team=red
+```
+
+For regular players, the accepted value is persisted in `PlayerRuntime.RequestedTeam`.
+
+- `RequestedTeam = "blue"`: the player is restored to blue during `resetGame`.
+- `RequestedTeam = "red"`: the player is restored to red during `resetGame`.
+- `RequestedTeam = "auto"`: the player may be assigned to whichever team has fewer players during connect or reset.
+
+`ReassignPlayerTeams()` first restores all fixed `blue` / `red` players, counts those assignments, then distributes `auto` players to the smaller team. This prevents a reset from overriding the user's fixed selection.
 
 ### Spawn rules
 
@@ -295,7 +322,7 @@ Each room runs the same authoritative simulation rules:
 - If a player dies while carrying a flag, the flag drops at the elimination point.
 - If a player disconnects while carrying a flag, that flag is reset to base in the same room only.
 - `resetGame` resets only the sender's room.
-- `resetGame` resets scores, flags, inputs, cooldowns, shots, effects, timer, teams, and player positions in that room.
+- `resetGame` resets scores, flags, inputs, cooldowns, shots, effects, timer, team assignment, and player positions in that room. Fixed requested teams are restored first; `auto` players are then distributed to the smaller team.
 - `resetGame` can be used during an active match or after a match has finished.
 
 ### Combat
@@ -470,9 +497,10 @@ If the active-room limit has been reached, the server returns `429 Too Many Requ
 
 ```text
 /ws?room=<roomId>&team=<auto|blue|red>
+/ws?room=<roomId>&spectator=<true|false>
 ```
 
-Both query parameters are optional. Missing or empty `room` uses `public`. Missing or empty `team` uses `auto`, preserving balanced auto-assignment.
+All query parameters are optional. Missing or empty `room` uses `public`. Missing or empty `team` uses `auto`, preserving balanced auto-assignment. Missing or empty `spectator` uses `false`. When `spectator=true`, the connection observes the room without creating a player and any `team` parameter is ignored.
 
 ### Client to server
 
@@ -491,7 +519,7 @@ Details:
 - `input` updates the current directional state while the room match is running.
 - `shoot` queues a shot for the next simulation tick while the room match is running.
 - `ping` is answered with `pong` only to the same client.
-- `resetGame` starts a fresh match only in the sender's room and reassigns teams in that room.
+- `resetGame` starts a fresh match only in the sender's room; it restores fixed requested teams first and rebalances only `auto` players. Spectator connections cannot reset the match.
 - Movement and shooting are ignored after the match has finished until `resetGame` is received.
 
 ### Server to client
@@ -512,7 +540,15 @@ Initial message:
     "autoAssigned": true
   },
   "tickRate": 20,
-  "mapName": "Blaze Field"
+  "mapName": "Blaze Field",
+  "training": {
+    "enabled": false,
+    "timeScale": 1,
+    "runAsFastAsPossible": false,
+    "maxSimulationStepSeconds": 0.016666667,
+    "maxSimulationSubstepsPerTick": 3,
+    "matchClockDisabled": false
+  }
 }
 ```
 
@@ -529,7 +565,15 @@ For spectators, `connectionId` is generated with an `s-` prefix, `playerId` and 
   "team": null,
   "teamSelection": null,
   "tickRate": 20,
-  "mapName": "Blaze Field"
+  "mapName": "Blaze Field",
+  "training": {
+    "enabled": false,
+    "timeScale": 1,
+    "runAsFastAsPossible": false,
+    "maxSimulationStepSeconds": 0.016666667,
+    "maxSimulationSubstepsPerTick": 3,
+    "matchClockDisabled": false
+  }
 }
 ```
 
@@ -539,6 +583,8 @@ State snapshot:
 {
   "type": "state",
   "roomId": "alpha",
+  "sequence": 123,
+  "matchId": "m-123",
   "serverTime": 1710000000000,
   "scores": { "blue": 0, "red": 0 },
   "match": {
@@ -554,7 +600,15 @@ State snapshot:
   "players": [],
   "flags": [],
   "shots": [],
-  "events": []
+  "events": [],
+  "playerStats": [],
+  "training": {
+    "enabled": false,
+    "timeScale": 1,
+    "runAsFastAsPossible": false,
+    "maxSimulationStepSeconds": 0.016666667,
+    "maxSimulationSubstepsPerTick": 3
+  }
 }
 ```
 
@@ -601,7 +655,7 @@ Latency event:
 
 ### `events`
 
-Confirmed hits are exposed as ephemeral events:
+Confirmed hits are always exposed as ephemeral visual events so the client can render feedback. When `trainingMode=true`, additional training events are also included in the same `events` array: `matchReset`, `matchFinished`, `playerJoined`, `playerLeft`, `shotFired`, `playerHit`, `playerEliminated`, `flagPickedUp`, `flagDropped`, `flagReturned`, and `flagCaptured`.
 
 ```json
 {
@@ -617,7 +671,7 @@ Confirmed hits are exposed as ephemeral events:
 }
 ```
 
-This lets the client render visual feedback while still relying on the server's authoritative result.
+This lets the client render visual feedback while still relying on the server's authoritative result. Training collectors can additionally consume `playerStats` for aggregate per-player counters.
 
 ## Map structure expected by the server
 
@@ -674,11 +728,11 @@ The server includes the following defensive controls:
 - Local loopback origins are allowed for development, including `localhost`, `127.0.0.1`, and `::1` with arbitrary ports.
 - WebSocket handshakes validate the `Origin` header before accepting the connection.
 - `Origin: null` is accepted only for loopback requests.
-- Incoming WebSocket messages are rate-limited per client.
-- Idle WebSocket clients are disconnected after 30 seconds without inbound messages.
+- Incoming WebSocket messages are rate-limited per client in production mode.
+- Idle WebSocket clients are disconnected after 30 seconds without inbound messages in production mode.
 - Incoming WebSocket messages are limited to 16 KB.
 - Slow or failed WebSocket writers are removed.
-- `resetGame` is accepted only after at least 60 seconds of match time have elapsed.
+- `resetGame` is accepted only after at least 60 seconds of match time have elapsed in production mode; training mode can set `resetCooldownSeconds` to `0`.
 - `PUT /api/map` rejects request bodies larger than 1 MB.
 - Server-side map validation enforces strict limits before accepting or persisting a new map.
 - Room creation is protected by strict room ID validation and `MaxActiveRooms`.
@@ -742,6 +796,14 @@ Connect another client to an isolated room:
 const socketC = new WebSocket("ws://127.0.0.1:5770/ws?room=beta");
 ```
 
+Connect fixed-team players and a spectator:
+
+```js
+const bluePlayer = new WebSocket("ws://127.0.0.1:5770/ws?room=alpha&team=blue");
+const redPlayer = new WebSocket("ws://127.0.0.1:5770/ws?room=alpha&team=red");
+const spectator = new WebSocket("ws://127.0.0.1:5770/ws?room=alpha&spectator=true");
+```
+
 Expected results:
 
 - `alpha` sees only players from `alpha`.
@@ -750,6 +812,8 @@ Expected results:
 - `/ws` joins `public`.
 - `/api/rooms` lists active rooms and player counts.
 - `PUT /api/map` returns `409 Conflict` while any room has active players or WebSocket clients.
+- Fixed `team=blue` and `team=red` players remain on their requested teams after `resetGame`; only `auto` players are rebalanced.
+- The spectator receives `welcome` and `state` snapshots but does not create a player and cannot move, shoot, or reset.
 
 ## Current limitations
 
@@ -757,7 +821,7 @@ Expected results:
 - There is no persistent match storage.
 - There is no authentication.
 - There is no replay or match history.
-- There are no AI players or bots.
+- There are no built-in AI-controlled players or bots; `trainingMode` emits telemetry for external bot/model pipelines.
 - Spawn points are procedural and are not explicit objects in the map JSON.
 - Friendly fire is enabled.
 - There is no advanced interpolation or reconciliation in the backend.
@@ -772,14 +836,9 @@ Expected results:
 - `launchSettings.json` contains Visual Studio URLs, but the actual code uses `UseUrls("http://0.0.0.0:5770")`.
 - `log.txt` is created in `AppContext.BaseDirectory`, which is normally the folder that contains the executable or published app binaries.
 
-## Author
-
-**David Jorge Aguirre Grazio**  
-Developer
-
 ## Training-oriented server mode
 
-The authoritative server can run either with production-safe runtime settings or with training-oriented settings for bot preparation.
+The authoritative server can run either with production-safe runtime settings or with training-oriented settings for synthetic AI-training data generation. This mode does not spawn bots by itself; it exposes deterministic episode metadata, event streams, and player statistics for external bot clients, collectors, or model-training harnesses.
 
 Runtime settings are read from `server-runtime.json` in `AppContext.BaseDirectory`. Environment variables are not used.
 
@@ -839,7 +898,7 @@ Relevant settings when `trainingMode=true`:
 
 State snapshots always include top-level `sequence` and `matchId`, plus `match.id`.
 
-When `trainingMode=true`, state snapshots also include populated `events` and `playerStats` training telemetry. When `trainingMode=false`, those arrays are emitted empty and the server avoids generating training event/stat data.
+When `trainingMode=true`, state snapshots also include populated `events` and `playerStats` training telemetry. When `trainingMode=false`, `playerStats` is empty and the server avoids generating training event/stat data, while still emitting short-lived client-compatible visual events such as `playerHit` for gameplay effects.
 
 Training events include:
 
@@ -880,15 +939,16 @@ Example `playerStats` payload:
 
 ## Training run preset
 
-This package is configured for validation runs with:
+For validation runs, enable `trainingMode=true` and use:
 
 ```json
 {
+  "trainingMode": true,
   "matchDurationSecondsOverride": 300
 }
 ```
 
-That creates 5-minute episodes. With the bot package default `maxRuntimeSeconds: 900`, a validation run should produce about three match summaries in 15 minutes. Set `matchDurationSecondsOverride` back to `0` for an infinite match.
+That creates 5-minute episodes. With a bot/client harness using `maxRuntimeSeconds: 900`, a validation run should produce about three match summaries in 15 minutes. Set `matchDurationSecondsOverride` to `0` for an infinite match. If `trainingMode=false`, the package intentionally ignores this override and uses production settings.
 
 ## Training episodes v3
 
@@ -898,6 +958,7 @@ Recommended 15-minute validation settings:
 
 ```json
 {
+  "trainingMode": true,
   "matchDurationSecondsOverride": 300,
   "resetCooldownSeconds": 0,
   "autoResetFinishedMatches": true
@@ -909,3 +970,8 @@ When a match reaches `matchDurationSecondsOverride`, the server emits one `match
 ## Movement collision update
 
 The player movement resolver now uses surface-aware sliding before falling back to axis-only movement. When a move collides with a hard obstacle, the server sweeps to the last free point, probes the impacted surface normal, offsets the player slightly away from the surface, and projects the remaining movement onto the tangent. This specifically improves glancing collisions against circular obstacles and sharp polygon/rectangle corners so players keep sliding instead of getting stuck until they walk away from the wall.
+
+## Author
+
+**David Jorge Aguirre Grazio**  
+Developer

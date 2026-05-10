@@ -8,6 +8,8 @@
 - a web-based map editor;
 - a JSON-based map format;
 - PWA support for desktop and mobile installation;
+- player-side team selection and spectator mode;
+- training-oriented runtime mode for AI data generation;
 - deployment support behind Nginx under `/theflag/`.
 
 ## Overview
@@ -16,17 +18,17 @@
 
 The game now supports multiple independent rooms. Each room behaves as a separate match with isolated players, teams, scores, flags, shots, timer, events, and reset flow. Clients can join the default `public` room or specify a room such as `alpha`, `test-01`, or any other valid room ID.
 
-The project also includes a dedicated map editor that can create and validate arenas, export them to JSON, and sync them with the backend when no active players are connected.
+The project also includes a dedicated map editor that can create and validate arenas, export them to JSON, and sync them with the backend when no active players are connected. The playable client also supports selecting a preferred team (`auto`, `blue`, or `red`) and joining as a spectator. The backend persists each player's requested team so fixed `blue` / `red` selections are respected across match resets, while `auto` players are rebalanced.
 
 ## Current project structure
 
 The repository contains three main modules:
 
 1. `server/`  
-   Authoritative .NET backend that manages rooms, simulates matches, exposes HTTP endpoints, accepts WebSocket connections, logs locally, loads the base map, and serves the PWA client under `/pwa/` when available.
+   Authoritative .NET backend that manages rooms, simulates matches, exposes HTTP endpoints, accepts WebSocket connections, logs locally, loads the base map, supports spectator clients, applies team-selection preferences, exposes training telemetry when enabled, and serves the PWA client under `/pwa/` when available.
 
 2. `client-pwa/`  
-   Active playable frontend. It is a static PWA with no build pipeline. It lets players choose a room and player name before connecting.
+   Active playable frontend. It is a static PWA with no build pipeline. It lets players choose a room, preferred team, spectator mode, and player name before connecting.
 
 3. `client-pwa/editor/`  
    Static map editor compatible with both the backend and the playable client.
@@ -41,8 +43,9 @@ The root also includes `nginx.conf`, with reverse-proxy routing for `/theflag/`,
 - independent rooms with isolated match state;
 - default room named `public`;
 - automatic room creation for valid room IDs;
-- automatic `blue` / `red` team assignment on connect;
-- full team reassignment on **Reset match**;
+- player-selectable team preference on connect: `auto`, `blue`, or `red`;
+- spectator mode for read-only match observation;
+- reset-time team handling that preserves fixed `blue` / `red` choices and only rebalances `auto` players;
 - 5-minute match timer controlled by the backend;
 - match-finished state with winner, loser, tie support, and final scores;
 - desktop keyboard movement;
@@ -58,7 +61,8 @@ The root also includes `nginx.conf`, with reverse-proxy routing for `/theflag/`,
 - flag capture, carry, drop, return, and score;
 - players can return their own dropped flag even while carrying the enemy flag;
 - room-scoped match reset available at any time, including after the match ends;
-- basic ping measurement.
+- basic ping measurement;
+- optional training telemetry for model-training datasets when the server runs with `trainingMode=true`.
 
 ### Multi-room support
 
@@ -103,7 +107,8 @@ The root also includes `nginx.conf`, with reverse-proxy routing for `/theflag/`,
 - room input shown above **Player name**;
 - `public` as the default room;
 - support for preselecting a room through `?room=alpha`;
-- WebSocket connection through `/ws?room=<roomId>`;
+- support for preselecting team and spectator mode through `?team=red` and `?spectator=true`;
+- WebSocket connection through `/ws?room=<roomId>`, with optional `team=<blue|red>` or `spectator=true`;
 - portrait-mode minimap;
 - responsive UI;
 - HUD scoreboard for both teams;
@@ -111,7 +116,7 @@ The root also includes `nginx.conf`, with reverse-proxy routing for `/theflag/`,
 - compact translucent top-edge score/timer HUD for mobile visibility;
 - final-result overlay after the timer reaches zero;
 - connection watchdog that reconnects when state snapshots stop arriving;
-- automatic local team/accent refresh when the backend reassigns teams after reset.
+- automatic local team/accent refresh when the backend confirms team changes after reset.
 
 ### Map editor
 
@@ -132,7 +137,8 @@ The root also includes `nginx.conf`, with reverse-proxy routing for `/theflag/`,
 ```text
 Browser / PWA Client
   ├── loads map over HTTP: GET /api/map
-  ├── joins a room over WebSocket: /ws?room=<roomId>
+  ├── joins a room over WebSocket: /ws?room=<roomId>[&team=<blue|red>|&spectator=true]
+  ├── selects room/team/spectator mode via WebSocket query string
   ├── sends player intent: hello, input, shoot, ping, resetGame
   └── renders authoritative state snapshots from the server
 
@@ -180,6 +186,9 @@ The backend lives in `server/` and:
 - owns scores, flags, players, timer, shots, hit effects, and match-finished state per room;
 - exposes HTTP endpoints for health, map management, and room management;
 - accepts WebSocket clients through `/ws` and `/ws?room=<roomId>`;
+- accepts optional `team=auto|blue|red` and `spectator=true|false` connection preferences;
+- stores each player's requested team and preserves fixed `blue` / `red` assignments across `resetGame`;
+- can run with `trainingMode=true` to emit event/stat telemetry useful for AI training datasets;
 - serves the active PWA client at `http://localhost:5770/pwa/` when `client-pwa/` is available.
 
 ### Room isolation model
@@ -206,9 +215,11 @@ The active client lives in `client-pwa/` and:
 
 - loads the map through `GET /api/map`;
 - lets the player enter a room name before connecting;
+- lets the player select `auto`, `blue`, or `red` team preference before connecting;
+- lets the player enable spectator mode before connecting;
 - defaults to `public` if no room is provided;
-- supports `?room=<roomId>` in the page URL;
-- connects to the backend over WebSocket using `/ws?room=<roomId>`;
+- supports `?room=<roomId>`, `?team=<auto|blue|red>`, and `?spectator=true` in the page URL;
+- connects to the backend over WebSocket using `/ws?room=<roomId>` plus optional team or spectator query parameters;
 - renders the arena and players on a 2D canvas;
 - processes `shots`, `events`, scores, timer, flags, and match status emitted by the server;
 - sends player input, shooting, ping, and reset requests.
@@ -247,6 +258,7 @@ the_flag_game/
     MapLoader.cs
     Models.cs
     Program.cs
+    server-runtime.json
     README.md
     TheFlag.Server.csproj
     TheFlag.Server.sln
@@ -296,16 +308,18 @@ Current PWA client:
 http://127.0.0.1:5770/pwa/
 ```
 
-Use the **Room** field to choose the room before connecting. The default value is:
+Use the **Room** field to choose the room before connecting, the **Team** selector to choose `Auto`, `Blue`, or `Red`, and **Spectator mode** to observe without creating a player. The default room value is:
 
 ```text
 public
 ```
 
-You can also preselect a room with:
+You can also preselect connection options with:
 
 ```text
 http://127.0.0.1:5770/pwa/?room=alpha
+http://127.0.0.1:5770/pwa/?room=alpha&team=red
+http://127.0.0.1:5770/pwa/?room=alpha&spectator=true
 ```
 
 ### 3. Open the editor
@@ -332,24 +346,25 @@ or serve it as a static site and connect it to the backend.
 
 ## Match flow
 
-1. A player selects a room and enters a player name.
-2. The PWA connects to `/ws?room=<roomId>`.
+1. A user selects a room, connection mode, and player name.
+2. The PWA connects to `/ws?room=<roomId>` with optional `team=<blue|red>` or `spectator=true`.
 3. The backend creates the room automatically if it is valid and there is room capacity.
-4. Players connected to the same room are assigned to blue/red teams.
-5. The backend starts or continues that room's 5-minute match.
-6. Red players spawn near the upper-center area; blue players spawn near the lower-center area.
-7. Players can steal the enemy flag and must return it while their own flag is at base.
-8. If a player is hit while carrying a flag, the flag drops at the elimination point.
-9. A player can return their own dropped flag even while carrying the enemy flag.
-10. When the timer reaches zero, the server freezes that room's match and reports the winner or tie.
-11. Any connected player can press **Reset match** to start a new full match for that room only.
+4. Regular players are assigned according to their requested team: fixed `blue` / `red` when requested, otherwise balanced `auto` assignment.
+5. Spectators receive the same state snapshots but do not create a player, move, shoot, or reset the match.
+6. The backend starts or continues that room's 5-minute match.
+7. Red players spawn near the upper-center area; blue players spawn near the lower-center area.
+8. Players can steal the enemy flag and must return it while their own flag is at base.
+9. If a player is hit while carrying a flag, the flag drops at the elimination point.
+10. A player can return their own dropped flag even while carrying the enemy flag.
+11. When the timer reaches zero, the server freezes that room's match and reports the winner or tie.
+12. Any connected non-spectator player can press **Reset match** to start a new full match for that room only; fixed team choices are preserved and `auto` players are rebalanced.
 
 ## Useful endpoints
 
 ### HTTP
 
 - `GET /health`  
-  Returns global server health, active room count, total players, room limits, tick rate, and map information.
+  Returns global server health, active room count, total players, room limits, tick rate, map information, and effective training runtime settings.
 
 - `GET /api/map`  
   Returns the global base map JSON used by new rooms and the editor.
@@ -371,10 +386,18 @@ or serve it as a static site and connect it to the backend.
 - `WS /ws?room=<roomId>`  
   Connects to a specific room.
 
-Example:
+- `WS /ws?room=<roomId>&team=<auto|blue|red>`  
+  Connects as a regular player with a team preference. `auto` may be omitted.
+
+- `WS /ws?room=<roomId>&spectator=true`  
+  Connects as a spectator. Spectators receive snapshots but cannot play or reset.
+
+Examples:
 
 ```text
 ws://127.0.0.1:5770/ws?room=alpha
+ws://127.0.0.1:5770/ws?room=alpha&team=blue
+ws://127.0.0.1:5770/ws?room=alpha&spectator=true
 ```
 
 ## Room naming rules
@@ -408,6 +431,40 @@ The map editor works against the global base map:
 - `PUT /api/map` replaces `server/Data/map.json` only when no room has connected players or active WebSocket clients.
 
 This avoids mixing a new base map with already-running room state. After a map replacement, newly created rooms use the updated map.
+
+
+## Training-oriented runtime mode
+
+The server reads `server-runtime.json` from `AppContext.BaseDirectory`. It is fail-safe by default: when the file is missing or when `trainingMode` is `false`, production runtime settings are used and training-oriented values are ignored.
+
+When `trainingMode=true`, the server can accelerate or segment simulations for AI-data collection and emits telemetry suitable for synthetic training datasets:
+
+- top-level `sequence` and `matchId` in every state snapshot;
+- `match.id` for episode correlation;
+- populated `events` for match, combat, flag, join/leave, and reset events;
+- populated `playerStats` with shots, hits, eliminations, deaths, flag actions, carry time, and travelled distance;
+- optional faster simulation through `tickRate`, `timeScale`, `runAsFastAsPossible`, and physics substep limits;
+- optional training conveniences such as `resetCooldownSeconds=0`, `autoResetFinishedMatches=true`, disabled idle timeout, and disabled inbound rate limit.
+
+Important: `trainingMode` does not create AI players by itself. It prepares the authoritative simulation and telemetry stream so external bot clients or model-training harnesses can generate and collect data.
+
+Example training-oriented runtime file:
+
+```json
+{
+  "trainingMode": true,
+  "tickRate": 60,
+  "timeScale": 8,
+  "runAsFastAsPossible": false,
+  "matchDurationSecondsOverride": 300,
+  "resetCooldownSeconds": 0,
+  "autoResetFinishedMatches": true,
+  "disableClientIdleTimeout": true,
+  "maxMessagesPerRateLimitWindow": 0,
+  "maxSimulationStepSeconds": 0.008333333,
+  "maxSimulationSubstepsPerTick": 64
+}
+```
 
 ## Deployment notes
 
@@ -444,7 +501,7 @@ https://server.mcrenox.com/theflag/?room=alpha
 - no persistent match storage;
 - no account or matchmaking system;
 - no room browser in the PWA yet;
-- no bots or AI;
+- no built-in AI-controlled bots yet; training telemetry exists for external AI/model pipelines;
 - spawn zones are computed by the server, not configured in the map JSON;
 - maps are global, not room-specific;
 - the map editor cannot modify a map while active players are connected;
@@ -475,6 +532,8 @@ For more module-specific details:
 ## Suggested roadmap
 
 - room browser using `GET /api/rooms`;
+- export pipeline for training telemetry datasets;
+- bot/client harness that consumes `trainingMode` telemetry;
 - private/public room visibility;
 - shareable room links in the UI;
 - map-configurable spawn zones;

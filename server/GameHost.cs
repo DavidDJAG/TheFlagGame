@@ -473,6 +473,7 @@ public sealed class GameRoom
                     Id = assignedPlayerId,
                     Name = name,
                     Team = assignedTeam,
+                    RequestedTeam = requestedTeam,
                     Position = spawn,
                     SpawnPosition = spawn,
                     Facing = assignedTeam == "blue" ? new Vec2(1f, 0f) : new Vec2(-1f, 0f)
@@ -1023,16 +1024,40 @@ public sealed class GameRoom
             return;
         }
 
-        var players = _players.Values
-            .OrderBy(_ => _random.Next())
-            .ToList();
+        var blueCount = 0;
+        var redCount = 0;
+        var autoPlayers = new List<PlayerRuntime>();
 
-        var firstTeam = _random.Next(2) == 0 ? "blue" : "red";
-        var secondTeam = firstTeam == "blue" ? "red" : "blue";
-
-        for (var i = 0; i < players.Count; i++)
+        foreach (var player in _players.Values)
         {
-            players[i].Team = i % 2 == 0 ? firstTeam : secondTeam;
+            if (player.RequestedTeam == "blue")
+            {
+                player.Team = "blue";
+                blueCount++;
+            }
+            else if (player.RequestedTeam == "red")
+            {
+                player.Team = "red";
+                redCount++;
+            }
+            else
+            {
+                autoPlayers.Add(player);
+            }
+        }
+
+        foreach (var player in autoPlayers.OrderBy(_ => _random.Next()))
+        {
+            if (blueCount <= redCount)
+            {
+                player.Team = "blue";
+                blueCount++;
+            }
+            else
+            {
+                player.Team = "red";
+                redCount++;
+            }
         }
     }
 
@@ -2187,9 +2212,35 @@ public sealed class GameRoom
         return $"m-{Guid.NewGuid():N}";
     }
 
-    private GameEventRuntime[] BuildEventsPayload()
+    private object[] BuildEventsPayload()
     {
-        return IsTrainingTelemetryEnabled ? _frameEvents.ToArray() : Array.Empty<GameEventRuntime>();
+        var events = new List<object>();
+
+        if (IsTrainingTelemetryEnabled)
+        {
+            var activeHitEffectIds = _hitEffects
+                .Select(effect => effect.Id)
+                .ToHashSet(StringComparer.Ordinal);
+
+            events.AddRange(_frameEvents
+                .Where(gameEvent => gameEvent.Type != "playerHit" || !activeHitEffectIds.Contains(gameEvent.Id))
+                .Select(gameEvent => (object)gameEvent));
+        }
+
+        events.AddRange(_hitEffects.Select(effect => (object)new
+        {
+            id = effect.Id,
+            type = "playerHit",
+            shooterPlayerId = effect.ShooterPlayerId,
+            victimPlayerId = effect.VictimPlayerId,
+            shooterTeam = effect.ShooterTeam,
+            victimTeam = effect.VictimTeam,
+            impactX = effect.ImpactPosition.X,
+            impactY = effect.ImpactPosition.Y,
+            life = effect.RemainingLifetime
+        }));
+
+        return events.ToArray();
     }
 
     private object[] BuildPlayerStatsPayload()

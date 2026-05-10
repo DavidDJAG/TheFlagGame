@@ -148,8 +148,9 @@ Generated WebSocket examples:
 - real-time match state updates with visual interpolation for smoother player movement
 - doubled player footstep animation cadence without changing gameplay displacement speed
 - final-result overlay when the server marks the match as finished
-- **Reset Match** sends `resetGame`, which resets scores, flags, timer, teams, and positions in the current backend room
-- local player team/accent updates when the backend reassigns teams after reset
+- **Reset Match** sends `resetGame`, which resets scores, flags, timer, inputs, cooldowns, effects, and positions in the current backend room
+- fixed team selections are preserved by the backend across reset; only `Auto` players may be rebalanced
+- local player team/accent updates when the backend confirms a team after connect or reset
 
 ### Multi-room behavior
 
@@ -157,7 +158,7 @@ The frontend joins exactly one backend room per WebSocket connection.
 
 - `/ws` remains compatible with the backend default room, but this client explicitly sends `/ws?room=<roomId>`.
 - Players in different rooms do not see or affect each other when the backend multi-room server is used.
-- Reset, scores, flags, shots, hits, timer, and match result are room-scoped by the backend.
+- Reset, scores, flags, shots, hits, timer, team assignment, and match result are room-scoped by the backend.
 - The current map is still global and loaded through `GET /api/map`.
 - The client does not yet list rooms from `GET /api/rooms`; room names are entered manually.
 
@@ -227,7 +228,7 @@ http://127.0.0.1:5770
 - `basePath` or `publicPath`: public path prefix when the backend is reverse-proxied
 - `room`: initial room shown in the Room field
 - `team`: initial team selector value; accepted values are `auto`, `blue`, and `red`
-- `spectator`: initial spectator-mode value; accepted true values include `true`, `1`, and `yes`
+- `spectator`: initial spectator-mode value; accepted true values include `true`, `1`, and `yes`; accepted false values include `false`, `0`, and `no`
 
 Examples:
 
@@ -259,6 +260,8 @@ and it will route API and WebSocket traffic through the same public prefix.
 - `WS /ws?room=<roomId>&team=<blue|red>`
 - `WS /ws?room=<roomId>&spectator=true`
 
+`team=auto` is equivalent to omitting the `team` parameter. When `spectator=true`, the backend ignores team selection because no player entity is created.
+
 When deployed under `/theflag/`, these effectively become:
 
 - `GET /theflag/api/map`
@@ -285,7 +288,7 @@ The room, requested team, and spectator mode are not sent as JSON messages. They
 /ws?room=alpha&spectator=true
 ```
 
-When the selector is `Auto`, no `team` parameter is sent. When spectator mode is unchecked, no `spectator` parameter is sent.
+When the selector is `Auto`, no `team` parameter is sent. When spectator mode is unchecked, no `spectator` parameter is sent. Fixed `blue` / `red` selections are persisted by the backend for that WebSocket player and survive `resetGame`; `Auto` players may be rebalanced on reset.
 
 ### Server -> client
 
@@ -293,11 +296,25 @@ When the selector is `Auto`, no `team` parameter is sent. When spectator mode is
 {
   "type": "welcome",
   "roomId": "alpha",
+  "connectionId": "p-123",
   "playerId": "p-123",
-  "team": "blue",
+  "role": "player",
   "spectator": false,
+  "team": "blue",
+  "teamSelection": {
+    "requested": "blue",
+    "autoAssigned": false
+  },
   "tickRate": 20,
-  "mapName": "Blaze Field"
+  "mapName": "Blaze Field",
+  "training": {
+    "enabled": false,
+    "timeScale": 1,
+    "runAsFastAsPossible": false,
+    "maxSimulationStepSeconds": 0.016666667,
+    "maxSimulationSubstepsPerTick": 3,
+    "matchClockDisabled": false
+  }
 }
 ```
 
@@ -305,6 +322,8 @@ When the selector is `Auto`, no `team` parameter is sent. When spectator mode is
 {
   "type": "state",
   "roomId": "alpha",
+  "sequence": 123,
+  "matchId": "m-123",
   "serverTime": 1710000000000,
   "scores": { "blue": 0, "red": 0 },
   "match": {
@@ -320,7 +339,15 @@ When the selector is `Auto`, no `team` parameter is sent. When spectator mode is
   "players": [],
   "flags": [],
   "shots": [],
-  "events": []
+  "events": [],
+  "playerStats": [],
+  "training": {
+    "enabled": false,
+    "timeScale": 1,
+    "runAsFastAsPossible": false,
+    "maxSimulationStepSeconds": 0.016666667,
+    "maxSimulationSubstepsPerTick": 3
+  }
 }
 ```
 
@@ -331,7 +358,7 @@ When the selector is `Auto`, no `team` parameter is sent. When spectator mode is
 }
 ```
 
-The client uses the `match` object to render the countdown timer and the final-result overlay.
+The client uses the `match` object to render the countdown timer and the final-result overlay. In normal production mode, `playerStats` is empty and only client-compatible visual events such as `playerHit` are needed by the PWA. When the server runs with `trainingMode=true`, `events` and `playerStats` can contain additional telemetry for AI-data collection, but the PWA remains a playable/spectator client, not a data exporter.
 
 ## Match timer and result display
 
@@ -390,13 +417,13 @@ Open two browser tabs with the same room, for example:
 http://127.0.0.1:5770/pwa/?room=alpha
 ```
 
-Both clients should see each other. Then open a third tab with another room:
+Both clients should see each other. To validate fixed team selection, open one tab with `?team=blue` and another with `?team=red`, press **Reset Match**, and confirm they remain on those teams. Then open a third tab with another room:
 
 ```text
 http://127.0.0.1:5770/pwa/?room=beta
 ```
 
-The `beta` client should not see players, shots, flags, scores, or reset effects from `alpha`.
+The `beta` client should not see players, shots, flags, scores, or reset effects from `alpha`. To validate spectator mode, open `?room=alpha&spectator=true`; it should see snapshots but have disabled gameplay controls and reset actions.
 
 ### Option 2: as a static site
 

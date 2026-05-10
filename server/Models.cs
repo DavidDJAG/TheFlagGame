@@ -188,6 +188,10 @@ public sealed class PlayerRuntime
     public required string Id { get; init; }
     public required string Name { get; set; }
     public required string Team { get; set; }
+
+    [JsonIgnore]
+    public string RequestedTeam { get; init; } = "auto";
+
     public Vec2 Position { get; set; }
     public Vec2 SpawnPosition { get; set; }
     public Vec2 Facing { get; set; } = new(1f, 0f);
